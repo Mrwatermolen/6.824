@@ -15,6 +15,10 @@ import "io/ioutil"
 import "sort"
 
 // for sorting by key.
+/*type KeyValue struct {
+	Key   string
+	Value string
+}*/
 type ByKey []mr.KeyValue
 
 // for sorting by key.
@@ -23,12 +27,13 @@ func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 func main() {
+	// go run -race mrsequential.go wc.so pg*.txt
 	if len(os.Args) < 3 {
 		fmt.Fprintf(os.Stderr, "Usage: mrsequential xxx.so inputfiles...\n")
 		os.Exit(1)
 	}
 
-	mapf, reducef := loadPlugin(os.Args[1])
+	mapf, reducef := loadPlugin(os.Args[1]) //返回两个函数
 
 	//
 	// read each input file,
@@ -46,8 +51,8 @@ func main() {
 			log.Fatalf("cannot read %v", filename)
 		}
 		file.Close()
-		kva := mapf(filename, string(content))
-		intermediate = append(intermediate, kva...)
+		kva := mapf(filename, string(content)) // Map函数处理 返回[]mr.KeyValue
+		intermediate = append(intermediate, kva...) // 这个...是啥
 	}
 
 	//
@@ -56,7 +61,7 @@ func main() {
 	// rather than being partitioned into NxM buckets.
 	//
 
-	sort.Sort(ByKey(intermediate))
+	sort.Sort(ByKey(intermediate)) // 根据key排序中间键
 
 	oname := "mr-out-0"
 	ofile, _ := os.Create(oname)
@@ -74,8 +79,8 @@ func main() {
 		values := []string{}
 		for k := i; k < j; k++ {
 			values = append(values, intermediate[k].Value)
-		}
-		output := reducef(intermediate[i].Key, values)
+		} // 将所有key相同的中间键添加进values中
+		output := reducef(intermediate[i].Key, values) // Reduce函数 
 
 		// this is the correct format for each line of Reduce output.
 		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
@@ -89,7 +94,7 @@ func main() {
 //
 // load the application Map and Reduce functions
 // from a plugin file, e.g. ../mrapps/wc.so
-//
+// 加载插件 返回两个函数
 func loadPlugin(filename string) (func(string, string) []mr.KeyValue, func(string, []string) string) {
 	p, err := plugin.Open(filename)
 	if err != nil {

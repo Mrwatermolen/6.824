@@ -15,6 +15,7 @@ import "os"
 import "fmt"
 
 func main() {
+	// go run -race mrcoordinator.go pg-*.txt
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "Usage: mrcoordinator inputfiles...\n")
 		os.Exit(1)
