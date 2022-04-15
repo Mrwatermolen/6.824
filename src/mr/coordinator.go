@@ -171,7 +171,9 @@ func (c *Coordinator) GetTask(args *RequestArgs, reply *RespondBody) error {
 
 	if c.TaskSqNum <= 0 {
 		// 任务队列为空 Worker应该继续等待 不能读取chan 防止阻塞
-		return errors.New("Worker ID: " + fmt.Sprintf("%d", args.WorkerID) + " GetTask. Chan is empty")
+		reply.WorkerID = -1 // 这里直接返回-1的WorkerID做了约定 返回-1 允许Worker继续工作
+		// return errors.New("Worker ID: " + fmt.Sprintf("%d", args.WorkerID) + " GetTask. Chan is empty")
+		return nil
 	}
 	checkStatus, ok := c.MapperRecord[args.WorkerID]
 	if !ok {

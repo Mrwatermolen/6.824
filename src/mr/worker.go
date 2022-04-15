@@ -82,12 +82,14 @@ func (w *WorkerBody) runWorker() bool {
 	// 成功请求到任务后 无论任务是否执行失败 都返回true
 	// 2. 执行任务
 	// 3. 执行结束后 报告执行情况
-	if w.RequestTask() {
+	if w.RequestTask() == w.WorkerID {
 		taskSuccess := true
 		if !w.ProcessTask() {
 			taskSuccess = false
 		}
 		w.ReportTasktoCoordinator(taskSuccess)
+		return true
+	} else if w.RequestTask() == -1 {
 		return true
 	}
 	return false
@@ -142,19 +144,24 @@ func (w *WorkerBody) CallRegisteWorker() bool {
 //
 // 向coordinator请求任务 RPC: Coordinator.GetTask
 //
-func (w *WorkerBody) RequestTask() bool {
+func (w *WorkerBody) RequestTask() int {
 	args := RequestArgs{}
 	reply := RespondBody{}
+	reply.WorkerID = 0
 	//fmt.Printf("RequestTask Start!\n")
 	args.WorkerID = w.WorkerID // 声明WorkerID
 	ok := call("Coordinator.GetTask", &args, &reply)
 	if ok {
 		w.Task = reply.Task // 接收Task
+		if reply.WorkerID != -1 {
+			// 约定 返回-1 允许Worker继续工作
+			return w.WorkerID
+		}
 		//fmt.Printf("RequestTask Succeeded! Task %v\n", w.Task)
 	} else {
 		//fmt.Printf("RequestTask failed!\n")
 	}
-	return ok
+	return reply.WorkerID
 }
 
 //
