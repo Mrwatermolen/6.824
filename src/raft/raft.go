@@ -331,6 +331,7 @@ func (rf *Raft) sendRequestVote(serverId int, args *RequestVoteArgs, reply *Requ
 	if rf.serverState != ServerStateCandidate {
 		DPrintf("Candidate ID is %v in state %v. Election Term is %v. Stop sending RequestVote() to Server %v for state %v", rf.me, rf.serverState, rf.currentTerm, serverId, rf.serverState)
 		cond.Broadcast() // to awake routine is stucked by cond.wait()
+		rf.mu.Unlock()
 		return false
 	}
 
@@ -372,6 +373,7 @@ func (rf *Raft) sendRequestAppendEntries(serverId int, args *RequestAppendEntrie
 	// make sure state still is candidate
 	if rf.serverState != ServerStateLeader {
 		DPrintf("Leader ID is %v in state %v. Leader Term is %v. Send sendRequestAppendEntries() to Server %v. Old leader stoped!", rf.me, rf.serverState, rf.currentTerm, serverId)
+		rf.mu.Unlock()
 		return false
 	}
 
