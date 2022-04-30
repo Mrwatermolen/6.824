@@ -189,57 +189,6 @@ type RequestVoteReply struct {
 	VoteGranted bool // whether get vote
 }
 
-//
-// RequestVote RPC handler.
-//
-// if agrs.Term < currentTerm. Reject this request.
-//
-// if agrs.Term > currentTerm. Grant vote and update state.
-//
-// if args.Term == rf.currentTerm. Follow the paper, checker votedFor is null(-1) or has voted.
-//
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-	// If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	DPrintf("Server %v get RequestVote in term %v in state %v. argsTerm is %v. CandidateId is %v", rf.me, rf.currentTerm, rf.serverState, args.Term, args.CandidateId)
-	reply.Term = rf.currentTerm // reply currentTerm
-	if args.Term > rf.currentTerm {
-		// Recieve bigger term
-		// Grant vote
-		reply.VoteGranted = true
-		rf.votedFor = args.CandidateId
-		// Update state.
-		rf.serverState = ServerStateFollower // transfer to Follower
-		rf.currentTerm = args.Term           // Update currentTerm
-		rf.lastActiveTime = time.Now()       // Update election timeout
-		reply.Term = rf.currentTerm
-		DPrintf("Server %v get RequestVote. Get High Term %v. Grant vote %v", rf.me, args.Term, args.CandidateId)
-	} else if args.Term == rf.currentTerm {
-		// Determine whether it has voted
-		if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
-			// Deny vote
-			DPrintf("Server %v get RequestVote. Refuse it for rf.votedFor is %v", rf.me, rf.votedFor)
-			reply.VoteGranted = false
-		} else {
-			// accept it
-			reply.VoteGranted = true
-			rf.votedFor = args.CandidateId
-			rf.serverState = ServerStateFollower // transfer to Follower
-			rf.currentTerm = args.Term           // Update currentTerm
-			rf.lastActiveTime = time.Now()       // Update election timeout
-			reply.Term = rf.currentTerm
-			DPrintf("Server %v get RequestVote. Grant vote %v", rf.me, args.CandidateId)
-		}
-	} else {
-		// agrs.Term < currentTerm. Reject this request.
-		DPrintf("Server %v get RequestVote. Refuse it for rf.currentTerm is %v", rf.me, rf.currentTerm)
-		reply.VoteGranted = false
-	}
-}
-
 type RequestAppendEntriesArgs struct {
 	// Your data here (2A, 2B).
 	Term         int // candidate’s term
@@ -259,6 +208,45 @@ type RequestAppendEntriesReply struct {
 }
 
 //
+// RequestVote RPC handler.
+//
+// if agrs.Term < currentTerm. Reject this request.
+//
+// if agrs.Term > currentTerm. Grant vote and update state.
+//
+// if args.Term == rf.currentTerm. Follow the paper, checker votedFor is null(-1) or has voted.
+//
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// Your code here (2A, 2B).
+	// If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	DPrintf("Server %v get RequestVote in term %v in state %v. argsTerm is %v. CandidateId is %v", rf.me, rf.currentTerm, rf.serverState, args.Term, args.CandidateId)
+	reply.Term = rf.currentTerm // reply currentTerm
+	reply.VoteGranted = false
+	if args.Term < rf.currentTerm {
+		// agrs.Term < currentTerm. Reject this request.
+		DPrintf("Server %v get RequestVote. Refuse it for rf.currentTerm is %v", rf.me, rf.currentTerm)
+		return
+	}
+
+	if args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+		// Deny vote
+		DPrintf("Server %v get RequestVote. Refuse it for rf.votedFor is %v", rf.me, rf.votedFor)
+		return
+	}
+
+	reply.VoteGranted = true
+	rf.votedFor = args.CandidateId
+	// Update state.
+	rf.serverState = ServerStateFollower // transfer to Follower
+	rf.currentTerm = args.Term           // Update currentTerm
+	rf.lastActiveTime = time.Now()       // Update election timeout
+	DPrintf("Server %v get RequestVote. Grant vote %v", rf.me, args.CandidateId)
+}
+
+//
 // RequestAppendEntries RPC handler. Only for 2A at this time
 //
 // if agrs.Term < currentTerm. Reject this request.
@@ -271,29 +259,26 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	DPrintf("Server %v get RequestAppendEntries in term %v in state %v. args is %v", rf.me, rf.currentTerm, rf.serverState, args)
+	DPrintf("Server %v get RequestAppendEntries in term %v in state %v from sever in term %v", rf.me, rf.currentTerm, rf.serverState, args.Term)
 	reply.Term = rf.currentTerm // reply currentTerm
-	if args.Term > rf.currentTerm {
-		// Recieve bigger term
-		DPrintf("Server %v get RequestAppendEntries in term %v in state %v. args.Term > rf.currentTerm. To be follower", rf.me, rf.currentTerm, rf.serverState)
-		rf.serverState = ServerStateFollower // transfer to Follower
-		rf.currentTerm = args.Term           // Update currentTerm
-		rf.lastActiveTime = time.Now()       // Update election timeout
-	} else if args.Term == rf.currentTerm {
-		if rf.serverState == ServerStateLeader {
-			// I am Leader. Reject it. There may be a brain-splited
-			DPrintf("Server %v get RequestAppendEntries in term %v in state %v. Refuse it for state in Leader", rf.me, rf.currentTerm, rf.serverState)
-		} else {
-			// follow this leader.
-			rf.serverState = ServerStateFollower // transfer to Follower
-			rf.lastActiveTime = time.Now()       // Update election timeout
-			DPrintf("Server %v get RequestAppendEntries in term %v in state %v. Update lastActiveTime", rf.me, rf.currentTerm, rf.serverState)
-		}
-	} else {
+	if args.Term < rf.currentTerm {
 		// agrs.Term < currentTerm. Reject this request.
 		DPrintf("Server %v get RequestAppendEntries in term %v in state %v. Refuse it for rf.currentTerm > args.Term %v", rf.me, rf.currentTerm, rf.serverState, args.Term)
+		return
 	}
 
+	if args.Term == rf.currentTerm && rf.serverState == ServerStateLeader {
+		// I am Leader. Reject it. There may be a brain-splited
+		DPrintf("Server %v get RequestAppendEntries in term %v in state %v. Refuse it for state in Leader", rf.me, rf.currentTerm, rf.serverState)
+		return
+
+	}
+
+	// Recieve bigger term
+	rf.serverState = ServerStateFollower // transfer to Follower
+	rf.currentTerm = args.Term           // Update currentTerm
+	rf.lastActiveTime = time.Now()       // Update election timeout
+	DPrintf("Server %v get RequestAppendEntries in term %v in state %v. Update lastActiveTime", rf.me, rf.currentTerm, rf.serverState)
 }
 
 //
@@ -334,36 +319,39 @@ func (rf *Raft) sendRequestVote(serverId int, args *RequestVoteArgs, reply *Requ
 		rf.mu.Unlock()
 		return false
 	}
-
 	DPrintf("Candidate ID is %v in state %v. Election Term is %v. Send RequestVote() to Server %v", rf.me, rf.serverState, rf.currentTerm, serverId)
 	args.Term = rf.currentTerm
 	args.CandidateId = rf.me
 	args.LastLogIndex = rf.leaderStateRecord.matchIndex[rf.me]
 	args.LastLogTerm = rf.currentTerm - 1
 	rf.mu.Unlock()
+
 	ok := rf.peers[serverId].Call("Raft.RequestVote", args, reply) // PRC RequestVote. Ask for vote
+
 	rf.mu.Lock()
-	if ok {
-		// Success.
-		DPrintf("Candidate ID is %v in state %v. Election Term is %v. Send RequestVote() to Server %v Succeed!", rf.me, rf.serverState, rf.currentTerm, serverId)
-		// confirm whether remote server has higher term.
-		if rf.currentTerm < reply.Term {
-			// get higher term.
-			rf.serverState = ServerStateFollower // transfer to Follower
-			rf.currentTerm = reply.Term          // Update currentTerm
-			rf.lastActiveTime = time.Now()       // Update election timeout
-			DPrintf("Candidate ID is %v in state %v. Election Term is %v. Get higher term. To be follower", rf.me, rf.serverState, rf.currentTerm)
-		} else if reply.VoteGranted {
-			// get a vote
-			*countVote = *countVote + 1
-		}
-	} else {
-		// Fail.
-		DPrintf("Candidate ID is %v in state %v. Election Term is %v. Send RequestVote() to Server %v Fail!", rf.me, rf.serverState, rf.currentTerm, serverId)
-	}
+	defer rf.mu.Unlock()
+
 	*finish = *finish + 1 // finish one RPC and ignore RPC state
-	cond.Broadcast()      // to awake routine is stucked by cond.wait()
-	rf.mu.Unlock()
+	if !ok {
+		// RPC Fail.
+		DPrintf("Candidate ID is %v in state %v. Election Term is %v. Send RequestVote() to Server %v Fail!", rf.me, rf.serverState, rf.currentTerm, serverId)
+		return ok
+	}
+	// PRC Success.
+	DPrintf("Candidate ID is %v in state %v. Election Term is %v. Send RequestVote() to Server %v Succeed!", rf.me, rf.serverState, rf.currentTerm, serverId)
+	// confirm whether remote server has higher term.
+	if rf.currentTerm < reply.Term {
+		// get higher term.
+		rf.serverState = ServerStateFollower // transfer to Follower
+		rf.currentTerm = reply.Term          // Update currentTerm
+		rf.lastActiveTime = time.Now()       // Update election timeout
+		DPrintf("Candidate ID is %v in state %v. Election Term is %v. Get higher term. To be follower", rf.me, rf.serverState, rf.currentTerm)
+	}
+	if reply.VoteGranted {
+		// get a vote
+		*countVote = *countVote + 1
+	}
+	cond.Broadcast() // to awake routine is stucked by cond.wait()
 	return ok
 }
 
@@ -380,24 +368,28 @@ func (rf *Raft) sendRequestAppendEntries(serverId int, args *RequestAppendEntrie
 	DPrintf("Leader ID is %v in state %v. Leader Term is %v. Send sendRequestAppendEntries() to Server %v", rf.me, rf.serverState, rf.currentTerm, serverId)
 	args.Term = rf.currentTerm
 	rf.mu.Unlock()
+
 	ok := rf.peers[serverId].Call("Raft.RequestAppendEntries", args, reply) // PRC RequestAppendEntries.
+
 	rf.mu.Lock()
-	if ok {
-		// Success.
-		DPrintf("Leader ID is %v in state %v. Leader Term is %v. Send sendRequestAppendEntries() to Server %v. Succeed!", rf.me, rf.serverState, rf.currentTerm, serverId)
-		// confirm whether remote server has higher term.
-		if rf.currentTerm < reply.Term {
-			// get higher term.
-			rf.serverState = ServerStateFollower // transfer to Follower
-			rf.currentTerm = reply.Term          // Update currentTerm
-			rf.lastActiveTime = time.Now()       // Update election timeout
-			DPrintf("Leader ID is %v. Get Higher term %v from server %v", rf.me, reply.Term, serverId)
-		}
-	} else {
-		// Fail.
+	defer rf.mu.Unlock()
+	if !ok {
+		// RPC Fail.
 		DPrintf("Leader ID is %v in state %v. Leader Term is %v. Send sendRequestAppendEntries() to Server %v. RPC Fail!", rf.me, rf.serverState, rf.currentTerm, serverId)
+		return ok
 	}
-	rf.mu.Unlock()
+	// RPC Success.
+	DPrintf("Leader ID is %v in state %v. Leader Term is %v. Send sendRequestAppendEntries() to Server %v. Succeed!", rf.me, rf.serverState, rf.currentTerm, serverId)
+	// confirm whether remote server has higher term.
+	if rf.currentTerm >= reply.Term {
+		return ok
+	}
+	// get higher term.
+	rf.serverState = ServerStateFollower // transfer to Follower
+	rf.currentTerm = reply.Term          // Update currentTerm
+	rf.lastActiveTime = time.Now()       // Update election timeout
+	DPrintf("Leader ID is %v. Get Higher term %v from server %v", rf.me, reply.Term, serverId)
+
 	return ok
 }
 
@@ -431,19 +423,22 @@ func (rf *Raft) StartElection() {
 		cond.Wait() // unlock rf.mu. block this thread until get cond signal
 	}
 	// confirm state
-	if rf.serverState == ServerStateCandidate {
+	if rf.serverState != ServerStateCandidate {
 		// still in candidate
-		if countVote > len(rf.peers)/2 {
-			// win the election. become leader and send heartbeat to other server at once
-			DPrintf("Candidate ID is %v in state %v. Election Term is %v. countVote is %v. finish is %v. Become Leader!", rf.me, rf.serverState, rf.currentTerm, countVote, finish)
-			rf.serverState = ServerStateLeader
-			go rf.HeartBeatTest()
-		} else {
-			DPrintf("Candidate ID is %v in state %v. Election Term is %v. countVote is %v. finish is %v. Lose in election!", rf.me, rf.serverState, rf.currentTerm, countVote, finish)
-		}
+		rf.mu.Unlock()
+		return
 	}
+	if countVote <= len(rf.peers)/2 {
+		// lost the election.
+		DPrintf("Candidate ID is %v in state %v. Election Term is %v. countVote is %v. finish is %v. Lose in election!", rf.me, rf.serverState, rf.currentTerm, countVote, finish)
+		rf.mu.Unlock()
+		return
+	}
+	// win the election. become leader and send heartbeat to other server at once
+	DPrintf("Candidate ID is %v in state %v. Election Term is %v. countVote is %v. finish is %v. Become Leader!", rf.me, rf.serverState, rf.currentTerm, countVote, finish)
+	rf.serverState = ServerStateLeader
+	go rf.HeartBeatTest()
 	rf.mu.Unlock()
-
 }
 
 //
@@ -500,7 +495,7 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		rf.mu.Lock()
 		DPrintf("Server %v ticker() Awake! Term: %v State: %v\t rf.lastActiveTime: %v, recordTime: %v", rf.me, rf.currentTerm, rf.serverState, rf.lastActiveTime, recordTime)
-		if !rf.lastActiveTime.IsZero() && rf.serverState != ServerStateLeader && !recordTime.Before(rf.lastActiveTime) {
+		if rf.serverState != ServerStateLeader && !recordTime.Before(rf.lastActiveTime) {
 			// didn't update lastActiveTime in electionTimeout. to start new election
 			rf.serverState = ServerStateCandidate // transfer to be candidate
 			rf.currentTerm++                      // increase term
@@ -576,7 +571,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = make([]interface{}, 0)
-	rf.lastActiveTime = time.Time{}
+	rf.lastActiveTime = time.Now()
 	rf.serverState = ServerStateFollower
 	rf.leaderStateRecord.matchIndex = make([]int, len(rf.peers))
 	rf.leaderStateRecord.nextIndex = make([]int, len(rf.peers))
