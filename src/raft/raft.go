@@ -40,7 +40,7 @@ const (
 	ServerStateLeader // 2
 )
 
-const UpdateHeartbeatInterval = 150
+const UpdateHeartbeatInterval = 100
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -251,7 +251,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// agrs.Term < currentTerm. Reject this request.
 	if args.Term < rf.currentTerm {
-
 		DPrintf("Server %v. State: %v. Term: %v. Get RequestVote from Server %v. Refuse it for rf.currentTerm is %v", rf.me, rf.serverState, rf.currentTerm, args.CandidateId, rf.currentTerm)
 		return
 	}
@@ -276,13 +275,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// If the logs have last entries with different terms, then the log with the later term is more up-to-date.
 	if args.LastLogTerm < rf.log[rf.lastLogIndex].Term {
 		// Deny vote
-		DPrintf("Server %v. State: %v. Term: %v. Get RequestVote from Server %v. Refuse it for up-to-date", rf.me, rf.serverState, rf.currentTerm, args.CandidateId)
+		DPrintf("Server %v. State: %v. Term: %v. Get RequestVote from Server %v. Refuse it for up-to-date. args.LastLogTerm: %v rf.log[rf.lastLogIndex].Term: %v lastIndex: %v", rf.me, rf.serverState, rf.currentTerm, args.CandidateId, args.LastLogTerm, rf.log[rf.lastLogIndex].Term, rf.lastLogIndex)
 		return
 	}
 	// If the logs end with the same term, then whichever log is longer is more up-to-date.
-	if args.LastLogIndex < rf.lastLogIndex {
+	if args.LastLogTerm == rf.log[rf.lastLogIndex].Term && args.LastLogIndex < rf.lastLogIndex {
 		// Deny vote
-		DPrintf("Server %v. State: %v. Term: %v. Get RequestVote from Server %v. Refuse it for up-to-date", rf.me, rf.serverState, rf.currentTerm, args.CandidateId)
+		DPrintf("Server %v. State: %v. Term: %v. Get RequestVote from Server %v. Refuse it for up-to-date. args.LastLogIndex: %v < rf.lastLogIndex: %v", rf.me, rf.serverState, rf.currentTerm, args.CandidateId, args.LastLogIndex, rf.lastLogIndex)
 		return
 	}
 
@@ -311,7 +310,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 
 	if args.Term < rf.currentTerm {
 		// agrs.Term < currentTerm. Reject this request.
-		DPrintf("Server %v. State: %v. Term: %v. Get RequestAppendEntries from Server %v. Refuse it for rf.currentTer", rf.me, rf.serverState, rf.currentTerm, args.LeaderID)
+		DPrintf("Server %v. State: %v. Term: %v. Get RequestAppendEntries from Server %v. Refuse it for args.Term %v < rf.currentTerm %v", rf.me, rf.serverState, rf.currentTerm, args.LeaderID, args.Term, rf.currentTerm)
 		return
 	}
 
@@ -338,7 +337,9 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	}
 
 	// Add new entries
-	for i, entry := range args.Entries {
+	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	rf.lastLogIndex = len(rf.log) - 1
+	/* for i, entry := range args.Entries {
 		index := args.PrevLogIndex + i + 1 // position of new entry in leader's log
 		// For follower, lastLogIndex is index of server’s last log entry.
 		// So it need be updated as changing server's log
@@ -353,7 +354,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 			DPrintf("Server %v. State: %v. Term: %v. Get RequestAppendEntries from Server %v. Delete the existing entry. new Log: %v", rf.me, rf.serverState, rf.currentTerm, args.LeaderID, rf.log)
 			DPrintf("Server %v. State: %v. Term: %v. Get RequestAppendEntries from Server %v. LeaderC: %v. My: %v", rf.me, rf.serverState, rf.currentTerm, args.LeaderID, args.LeaderCommit, rf.commandIndex)
 		}
-	}
+	} */
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	// It means server need to commit.
@@ -429,6 +430,7 @@ func (rf *Raft) sendRequestVote(serverId int, args *RequestVoteArgs, reply *Requ
 		DPrintf("Server %v. State: %v. Term: %v. Send RequestVote() to Server %v Fail!", rf.me, args.Term, rf.currentTerm, serverId)
 		return ok
 	}
+
 	// PRC Success.
 	DPrintf("Server %v. State: %v. Term: %v. Send RequestVote() to Server %v Succeed!", rf.me, rf.serverState, rf.currentTerm, serverId)
 	// confirm whether remote server has higher term.
@@ -475,7 +477,7 @@ func (rf *Raft) sendRequestAppendEntries(serverId int, args *RequestAppendEntrie
 			args.PrevLogIndex = rf.leaderStateRecord.nextIndex[serverId] // !!
 		} else {
 			args.PrevLogIndex = rf.lastLogIndex
-		}
+		} // TODO
 		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 		args.Entries = append([]LogEntry{}, rf.log[(args.PrevLogIndex+1):]...)
 		args.LeaderCommit = rf.commandIndex
@@ -673,7 +675,8 @@ func (rf *Raft) CommitLogEntries(commitIndex int) {
 	}
 
 	rf.commandIndex = commitIndex
-	entries := append([]LogEntry{}, rf.log[(rf.lastApplied+1):(rf.commandIndex+1)]...) // get slice that need to be committed
+	entries := rf.log[(rf.lastApplied + 1):(rf.commandIndex + 1)] // get slice that need to be committed
+	DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries(). CommitStartIndex %v CommitEndIndex %v", rf.me, rf.serverState, rf.currentTerm, rf.lastApplied+1, rf.commandIndex)
 	for index, item := range entries {
 		msg := ApplyMsg{
 			CommandValid: true,
@@ -685,6 +688,7 @@ func (rf *Raft) CommitLogEntries(commitIndex int) {
 		rf.applyCh <- msg
 	}
 	rf.lastApplied = rf.commandIndex
+	DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries() end. log: %v", rf.me, rf.serverState, rf.currentTerm, rf.log)
 }
 
 //
@@ -716,12 +720,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 
-	DPrintf("Server %v. State: %v. Term: %v. Recieve a command from client.", rf.me, rf.serverState, rf.currentTerm)
+	DPrintf("Server %v. State: %v. Term: %v. Recieve a command from client. %v", rf.me, rf.serverState, rf.currentTerm, command)
 	newlogEntry := LogEntry{}
 
 	// Update leader's log info
 	newlogEntry.Command = command
-	newlogEntry.CommandIndex = rf.lastLogIndex + 1 // !
+	// newlogEntry.CommandIndex = rf.lastLogIndex + 1 // !
+	newlogEntry.CommandIndex = len(rf.log) // !
 	newlogEntry.Term = rf.currentTerm
 	index = newlogEntry.CommandIndex
 	term = newlogEntry.Term
@@ -787,7 +792,7 @@ func (rf *Raft) HeartBeatTestTimer() {
 	for !rf.killed() {
 		time.Sleep(UpdateHeartbeatInterval * time.Millisecond)
 		rf.mu.Lock()
-		DPrintf("Server %v State %v Term %v HeartBeatTestTimer() Awake", rf.me, rf.serverState, rf.currentTerm)
+		DPrintf("Server %v. State: %v. Term: %v. HeartBeatTestTimer() Awake", rf.me, rf.serverState, rf.currentTerm)
 		if rf.serverState == ServerStateLeader {
 			// leader start HeartBeatTest()
 			// DPrintf("Leader %v. State: %v. Term: %v. RHeartBeatTest() Start", rf.me, rf.serverState, rf.currentTerm)
