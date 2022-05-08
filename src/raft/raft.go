@@ -40,7 +40,7 @@ const (
 	ServerStateLeader // 2
 )
 
-const UpdateHeartbeatInterval = 100
+const UpdateHeartbeatInterval = 110
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -242,7 +242,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// agrs.Term < currentTerm. Reject this request.
 	if args.Term < rf.currentTerm {
-		DPrintf("Server %v. State: %v. Term: %v. Get RequestVote from Server %v. Refuse it for rf.currentTerm is %v", rf.me, rf.serverState, rf.currentTerm, args.CandidateId, rf.currentTerm)
+		DPrintf("Server %v. State: %v. Term: %v. Get RequestVote from Server %v. Refuse it for args.Term %v < rf.currentTerm is %v", rf.me, rf.serverState, rf.currentTerm, args.CandidateId, args.Term, rf.currentTerm)
 		return
 	}
 
@@ -255,10 +255,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 
-	rf.BeFollower(args.Term)
+	// rf.BeFollower(args.Term)
+	// can't use func BeFollower(), because it can't update lastActiveTime at this time.
+	// if server update lastActiveTime at this moment, it couldn't start StartElection() when it deals with lost of RPC RequestVote
+	rf.serverState = ServerStateFollower // transfer to Follower
+	rf.currentTerm = args.Term           // Update currentTerm
+	// rf.votedFor = -1                     // Reset // ban it. It will cause brain-splited
+	rf.lastLogIndex = len(rf.log) - 1 // Update lastLogIndex
 
 	// check up-to-date
 	// If the logs have last entries with different terms, then the log with the later term is more up-to-date.
+	// 不能用 lastLogIndex
 	if args.LastLogTerm < rf.log[rf.lastLogIndex].Term {
 		// Deny vote
 		DPrintf("Server %v. State: %v. Term: %v. Get RequestVote from Server %v. Refuse it for up-to-date. args.LastLogTerm: %v rf.log[rf.lastLogIndex].Term: %v lastIndex: %v", rf.me, rf.serverState, rf.currentTerm, args.CandidateId, args.LastLogTerm, rf.log[rf.lastLogIndex].Term, rf.lastLogIndex)
@@ -271,6 +278,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	rf.lastActiveTime = time.Now() // Update election timeout
 	// Finally, grant vote
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateId
@@ -310,9 +318,9 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	}
 
 	// Add new entries
-	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-	rf.lastLogIndex = len(rf.log) - 1
-	/* for i, entry := range args.Entries {
+	/* rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	rf.lastLogIndex = len(rf.log) - 1 */
+	for i, entry := range args.Entries {
 		index := args.PrevLogIndex + i + 1 // position of new entry in leader's log
 		// For follower, lastLogIndex is index of server’s last log entry.
 		// So it need be updated as changing server's log
@@ -327,7 +335,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 			DPrintf("Server %v. State: %v. Term: %v. Get RequestAppendEntries from Server %v. Delete the existing entry. new Log: %v", rf.me, rf.serverState, rf.currentTerm, args.LeaderID, rf.log)
 			DPrintf("Server %v. State: %v. Term: %v. Get RequestAppendEntries from Server %v. LeaderC: %v. My: %v", rf.me, rf.serverState, rf.currentTerm, args.LeaderID, args.LeaderCommit, rf.commandIndex)
 		}
-	} */
+	}
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	// It means server need to commit.
@@ -424,24 +432,23 @@ func (rf *Raft) sendRequestVote(serverId int, args *RequestVoteArgs, reply *Requ
 }
 
 func (rf *Raft) sendRequestAppendEntries(serverId int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply, cond *sync.Cond, countAgree *int, finish *int) bool {
-	rf.mu.Lock()
-
-	// make sure state still is candidate or follower
-	if rf.serverState != ServerStateLeader {
-		DPrintf("Server %v. State: %v. Term: %v. Want to send RequestAppendEntries() to Server %v. Stoped!", rf.me, rf.serverState, rf.currentTerm, serverId)
-		cond.Broadcast()
-		rf.mu.Unlock()
-		return false
-	}
-
-	rf.mu.Unlock()
-
+	counterRPC := 1
 	for {
+		DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. Times: %v!", rf.me, rf.serverState, rf.currentTerm, serverId, counterRPC)
 		rf.mu.Lock()
+		DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. Times: %v! Get Lock!", rf.me, rf.serverState, rf.currentTerm, serverId, counterRPC)
+		// make sure state still is candidate or follower
+		if rf.serverState != ServerStateLeader {
+			DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. Times: %v! Stoped! rf.serverState != ServerStateLeader", rf.me, rf.serverState, rf.currentTerm, serverId, counterRPC)
+			cond.Broadcast()
+			rf.mu.Unlock()
+			return false
+		}
 
 		args.Term = rf.currentTerm
 		args.LeaderID = rf.me
 		// If last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
+		// 如果最新一条日志记录的 index 值大于等于某个 Follower 的 nextIndex 值，则通过 AppendEntries RPC 发送在该 nextIndex 值之后的所有日志记录：
 		args.PrevLogIndex = MinInt(rf.lastLogIndex, rf.leaderStateRecord.nextIndex[serverId])
 		/* if rf.lastLogIndex >= rf.leaderStateRecord.nextIndex[serverId] {
 			// Server $serverId need to update
@@ -452,40 +459,40 @@ func (rf *Raft) sendRequestAppendEntries(serverId int, args *RequestAppendEntrie
 		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 		args.Entries = append([]LogEntry{}, rf.log[(args.PrevLogIndex+1):]...)
 		args.LeaderCommit = rf.commandIndex
-		DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. args.PrevLogIndex: %v, args.PrevLogTerm: %v, args.LeaderCommit: %v", rf.me, rf.serverState, rf.currentTerm, serverId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
+		DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. Times: %v! args.PrevLogIndex: %v, args.PrevLogTerm: %v, args.LeaderCommit: %v", rf.me, rf.serverState, rf.currentTerm, serverId, counterRPC, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
+		//DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. args.PrevLogIndex: %v, args.PrevLogTerm: %v, args.LeaderCommit: %v", rf.me, rf.serverState, rf.currentTerm, serverId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
 
 		rf.mu.Unlock()
 
 		ok := rf.peers[serverId].Call("Raft.RequestAppendEntries", args, reply) // PRC RequestAppendEntries.
 
-		rf.mu.Lock()
-		// defer rf.mu.Unlock()
-
 		if !ok {
 			// RPC Fail.
-			DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. RPC Fail!", rf.me, rf.serverState, rf.currentTerm, serverId)
+			DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. Times: %v! RPC Fail!", rf.me, rf.serverState, rf.currentTerm, serverId, counterRPC)
 			*finish = *finish + 1 // finish one RPC and ignore RPC state
 			cond.Broadcast()
-			rf.mu.Unlock()
 			return ok
 		}
 
+		rf.mu.Lock()
+		// defer rf.mu.Unlock()
+
 		// RPC Success.
-		DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. RPC Succeed!", rf.me, rf.serverState, args.Term, serverId)
+		DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. Times: %v! RPC Succeed!", rf.me, rf.serverState, args.Term, serverId, counterRPC)
 
 		// confirm whether remote server has higher term.
 		if rf.currentTerm < reply.Term {
 			// get higher term.
 			rf.BeFollower(reply.Term)
 			*finish = *finish + 1 // finish one RPC and ignore RPC state
-			DPrintf("Server %v. State: %v. Term: %v. sendRequestAppendEntries. Get Higher term %v from server %v", rf.me, rf.serverState, rf.currentTerm, reply.Term, serverId)
+			DPrintf("Server %v. State: %v. Term: %v. sendRequestAppendEntries. Times: %v! Get Higher term %v from server %v", rf.me, rf.serverState, rf.currentTerm, reply.Term, serverId, counterRPC)
 			cond.Broadcast()
 			rf.mu.Unlock()
 			return ok
 		}
 
 		if rf.serverState != ServerStateLeader && rf.currentTerm != args.Term {
-			DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. no leader Quit", rf.me, rf.serverState, rf.currentTerm, serverId)
+			DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. Times: %v! no leader Quit", rf.me, rf.serverState, rf.currentTerm, serverId, counterRPC)
 			cond.Broadcast()
 			rf.mu.Unlock()
 			return ok
@@ -494,7 +501,8 @@ func (rf *Raft) sendRequestAppendEntries(serverId int, args *RequestAppendEntrie
 		// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
 		if !reply.Success {
 			rf.leaderStateRecord.nextIndex[serverId]--
-			DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. Index not matched.", rf.me, rf.serverState, rf.currentTerm, serverId)
+			DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. Times: %v! Index not matched. rf.leaderStateRecord.nextIndex[serverId]: %v. continue", rf.me, rf.serverState, rf.currentTerm, serverId, counterRPC, rf.leaderStateRecord.nextIndex[serverId])
+			counterRPC++
 			rf.mu.Unlock()
 			continue
 		}
@@ -503,6 +511,7 @@ func (rf *Raft) sendRequestAppendEntries(serverId int, args *RequestAppendEntrie
 		rf.leaderStateRecord.nextIndex[serverId] = rf.leaderStateRecord.matchIndex[serverId] + 1
 		*countAgree = *countAgree + 1
 		*finish = *finish + 1 // finish one RPC and ignore RPC state
+		DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. Times: %v! Success.", rf.me, rf.serverState, rf.currentTerm, serverId, counterRPC)
 
 		cond.Broadcast()
 		rf.mu.Unlock()
@@ -534,6 +543,7 @@ func (rf *Raft) StartElection() {
 		if rf.me != i {
 			args := RequestVoteArgs{}
 			reply := RequestVoteReply{}
+			DPrintf("Server %v. State:f1. Term: %v. StartElection(). countVote  is %v. finish is %v. go rf.sendRequestVote serverID: %v", rf.me, currentTerm, countVote, finish, i)
 			go rf.sendRequestVote(i, &args, &reply, cond, &countVote, &finish)
 		}
 	}
@@ -593,25 +603,28 @@ func (rf *Raft) UpdateFollowersLog() {
 		if i != rf.me {
 			args := RequestAppendEntriesArgs{}
 			reply := RequestAppendEntriesReply{}
+			DPrintf("Server %v. State:f0. Term: %v. UpdateFollowersLog. countAgree  is %v. finish is %v. go rf.sendRequestAppendEntries serverID: %v", rf.me, currentTerm, countAgree, finish, i)
 			go rf.sendRequestAppendEntries(i, &args, &reply, cond, &countAgree, &finish)
 		}
 	}
 
 	rf.mu.Lock()
 
+	DPrintf("Server %v. State:f0. Term: %v. UpdateFollowersLog. countAgree  is %v. finish is %v. Start Check!", rf.me, currentTerm, countAgree, finish)
 	for countAgree <= len(rf.peers)/2 && finish != len(rf.peers) && rf.serverState == ServerStateLeader && rf.currentTerm == currentTerm {
-		DPrintf("Server %v. State: %v. Term: %v. UpdateFollowersLog. countAgree  is %v. finish is %v", rf.me, rf.serverState, rf.currentTerm, countAgree, finish)
+		DPrintf("Server %v. State: %v. Term: %v. UpdateFollowersLog. countAgree  is %v. finish is %v. Wati", rf.me, rf.serverState, rf.currentTerm, countAgree, finish)
 		cond.Wait() // unlock mu. block this thread until get cond signal
 	}
 
 	// confirm state
 	if rf.serverState != ServerStateLeader || rf.currentTerm != currentTerm {
+		DPrintf("Server %v. State: %v. Term: %v. UpdateFollowersLog. countAgree  is %v. finish is %v. recordTerm: %v. Log replication fail!", rf.me, rf.serverState, rf.currentTerm, countAgree, finish, currentTerm)
 		rf.mu.Unlock()
 		return
 	}
 
 	if countAgree <= len(rf.peers)/2 {
-		DPrintf("Server %v. State: %v. Term: %v. UpdateFollowersLog. countAgree  is %v. finish is %v. Log replication fail!", rf.me, rf.serverState, rf.currentTerm, countAgree, finish)
+		DPrintf("Server %v. State: %v. Term: %v. UpdateFollowersLog. countAgree  is %v. finish is %v. countAgree <= len(rf.peers)/2 Log replication fail!", rf.me, rf.serverState, rf.currentTerm, countAgree, finish)
 		rf.mu.Unlock()
 		return
 	}
@@ -711,6 +724,7 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		rf.mu.Lock()
+		DPrintf("Server %v. State: %v. Term: %v. ticker() Awake  rf.lastActiveTime: %v, recordTime: %v", rf.me, rf.serverState, rf.currentTerm, rf.lastActiveTime, recordTime)
 		// DPrintf("Server %v ticker() Awake! Term: %v State: %v\t rf.lastActiveTime: %v, recordTime: %v", rf.me, rf.currentTerm, rf.serverState, rf.lastActiveTime, recordTime)
 		if rf.serverState != ServerStateLeader && !recordTime.Before(rf.lastActiveTime) {
 			// didn't update lastActiveTime in electionTimeout. to start new election
@@ -727,6 +741,7 @@ func (rf *Raft) ticker() {
 		rf.mu.Unlock()
 		time.Sleep(electionTimeout)
 	}
+	DPrintf("Server %v. State: %v. Term: %v. ticker() Quit. rf.killed", rf.me, rf.serverState, rf.currentTerm)
 }
 
 //
@@ -742,10 +757,12 @@ func (rf *Raft) HeartBeatTimer() {
 		if rf.serverState == ServerStateLeader {
 			// leader start HeartBeatTest()
 			// DPrintf("Leader %v. State: %v. Term: %v. RHeartBeatTest() Start", rf.me, rf.serverState, rf.currentTerm)
+			DPrintf("Server %v. State: %v. Term: %v. UpdateFollowersLog() Start", rf.me, rf.serverState, rf.currentTerm)
 			go rf.UpdateFollowersLog()
 		}
 		rf.mu.Unlock()
 	}
+	DPrintf("Server %v. State: %v. Term: %v. HeartBeatTimer() Quit. rf.killed", rf.me, rf.serverState, rf.currentTerm)
 }
 
 //
@@ -793,8 +810,9 @@ func (rf *Raft) BeFollower(currentTerm int) {
 	rf.serverState = ServerStateFollower // transfer to Follower
 	rf.currentTerm = currentTerm         // Update currentTerm
 	rf.lastActiveTime = time.Now()       // Update election timeout
-	rf.votedFor = -1                     // Reset
-	rf.lastLogIndex = len(rf.log) - 1    // Update lastLogIndex
+	// rf.votedFor = -1                     // Reset // ban it. It will cause brain-splited
+	rf.lastLogIndex = len(rf.log) - 1 // Update lastLogIndex
+	DPrintf("Server %v. State: %v. Term: %v. BeFollower(). rf.lastLogIndex: %v", rf.me, rf.serverState, rf.currentTerm, rf.lastLogIndex)
 }
 
 //
@@ -818,6 +836,31 @@ func (rf *Raft) CommitLogEntries(commitIndex int) {
 		// DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries(). Commit %v", rf.me, rf.serverState, rf.currentTerm, commitIndex)
 		rf.applyCh <- msg
 	}
+	/*
+		// routine casue channel
+		go func(applyStartIndex int, entries []LogEntry) {
+			for index, item := range entries {
+				msg := ApplyMsg{
+					CommandValid: true,
+					Command:      item.Command,
+					CommandIndex: index + applyStartIndex,
+				}
+				DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries(). Commit %v", rf.me, rf.serverState, rf.currentTerm, msg)
+				// DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries(). Commit %v", rf.me, rf.serverState, rf.currentTerm, commitIndex)
+				rf.applyCh <- msg
+
+				rf.mu.Lock()
+
+				if rf.lastApplied < msg.CommandIndex {
+					rf.lastApplied = msg.CommandIndex
+				}
+
+				rf.mu.Unlock()
+			}
+			// DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries() end. log: %v", rf.me, rf.serverState, rf.currentTerm, rf.log)
+			// DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries() end. loglen: %v", rf.me, rf.serverState, rf.currentTerm, len(rf.log))
+		}(rf.lastApplied+1, entries)
+	*/
 	rf.lastApplied = rf.commandIndex
 	DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries() end. log: %v", rf.me, rf.serverState, rf.currentTerm, rf.log)
 }
