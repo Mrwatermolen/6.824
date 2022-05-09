@@ -798,18 +798,29 @@ func (rf *Raft) CommitLogEntries(commitIndex int) {
 	rf.commandIndex = commitIndex
 	entries := rf.log[(rf.lastApplied + 1):(rf.commandIndex + 1)] // get slice that need to be committed
 	DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries(). CommitStartIndex %v CommitEndIndex %v", rf.me, rf.serverState, rf.currentTerm, rf.lastApplied+1, rf.commandIndex)
-	for index, item := range entries {
-		msg := ApplyMsg{
-			CommandValid: true,
-			Command:      item.Command,
-			CommandIndex: index + rf.lastApplied + 1,
+	// routine casue channel
+	go func(applyStartIndex int, entries []LogEntry) {
+		for index, item := range entries {
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      item.Command,
+				CommandIndex: index + applyStartIndex,
+			}
+
+			rf.applyCh <- msg
+
+			rf.mu.Lock()
+
+			DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries(). Commit %v", rf.me, rf.serverState, rf.currentTerm, msg)
+			if rf.lastApplied < msg.CommandIndex {
+				rf.lastApplied = msg.CommandIndex
+			}
+
+			rf.mu.Unlock()
 		}
-		DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries(). Commit %v", rf.me, rf.serverState, rf.currentTerm, msg)
-		// DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries(). Commit %v", rf.me, rf.serverState, rf.currentTerm, commitIndex)
-		rf.applyCh <- msg
-	}
-	rf.lastApplied = rf.commandIndex
-	DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries() end. log: %v", rf.me, rf.serverState, rf.currentTerm, rf.log)
+		DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries() end. log: %v", rf.me, rf.serverState, rf.currentTerm, rf.log)
+		DPrintf("Server %v. State: %v. Term: %v. CommitLogEntries() end. loglen: %v", rf.me, rf.serverState, rf.currentTerm, len(rf.log))
+	}(rf.lastApplied+1, entries)
 }
 
 func MaxInt(a int, b int) int {
