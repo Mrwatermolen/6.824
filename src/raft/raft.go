@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	ElectionTimeoutMin = 180
+	ElectionTimeoutMin = 150
 	ElectionTimeoutMax = 300
 )
 
@@ -306,7 +306,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		}
 	}
 
-	rf.BeFollower(args.Term)
+	rf.BeFollower(args.Term, args.LeaderID)
 	DPrintf("Server %v. State: %v. Term: %v. Get RequestAppendEntries from Server %v. Update lastActiveTime", rf.me, rf.serverState, rf.currentTerm, args.LeaderID)
 
 	// for old entries
@@ -398,7 +398,7 @@ func (rf *Raft) sendRequestVote(serverId int, cond *sync.Cond, countVote *int, f
 	// confirm whether remote server has higher term.
 	if rf.currentTerm < reply.Term {
 		// get higher term.
-		rf.BeFollower(reply.Term)
+		rf.BeFollower(reply.Term, -1)
 		DPrintf("Server %v. State: %v. Term: %v. Get higher term. To be follower", rf.me, rf.serverState, rf.currentTerm)
 	}
 
@@ -413,7 +413,7 @@ func (rf *Raft) sendRequestVote(serverId int, cond *sync.Cond, countVote *int, f
 
 func (rf *Raft) sendRequestAppendEntries(serverId int, cond *sync.Cond, countAgree *int, finish *int) bool {
 	counterRPC := 1
-	for {
+	for !rf.killed() {
 		rf.mu.Lock()
 
 		DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. Times: %v! Get Lock!", rf.me, rf.serverState, rf.currentTerm, serverId, counterRPC)
@@ -456,7 +456,7 @@ func (rf *Raft) sendRequestAppendEntries(serverId int, cond *sync.Cond, countAgr
 		// confirm whether remote server has higher term.
 		if rf.currentTerm < reply.Term {
 			// get higher term.
-			rf.BeFollower(reply.Term)
+			rf.BeFollower(reply.Term, -1)
 			*finish = *finish + 1 // finish one RPC and ignore RPC state
 			DPrintf("Server %v. State: %v. Term: %v. sendRequestAppendEntries. Times: %v! Get Higher term %v from server %v", rf.me, rf.serverState, rf.currentTerm, reply.Term, serverId, counterRPC)
 			cond.Broadcast()
@@ -490,7 +490,7 @@ func (rf *Raft) sendRequestAppendEntries(serverId int, cond *sync.Cond, countAgr
 		rf.mu.Unlock()
 		return ok
 	}
-
+	return false
 }
 
 //
@@ -686,12 +686,13 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ElectionTimer() {
 	var recordTime time.Time // record this thread awake time
+	var electionTimeout time.Duration
 	for !rf.killed() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		rf.mu.Lock()
 
-		DPrintf("Server %v. State: %v. Term: %v. ElectionTimer() Awake  rf.lastActiveTime: %v, recordTime: %v", rf.me, rf.serverState, rf.currentTerm, rf.lastActiveTime, recordTime)
+		DPrintf("Server %v. State: %v. Term: %v. ElectionTimer() Awake  rf.lastActiveTime: %v, recordTime: %v, electionTimeout: %v", rf.me, rf.serverState, rf.currentTerm, rf.lastActiveTime, recordTime, electionTimeout)
 		if rf.serverState != ServerStateLeader && !recordTime.Before(rf.lastActiveTime) {
 			// didn't update lastActiveTime in electionTimeout. to start new election
 			rf.serverState = ServerStateCandidate // transfer to be candidate
@@ -700,9 +701,9 @@ func (rf *Raft) ElectionTimer() {
 		}
 
 		rand.Seed(time.Now().Unix() + int64(rf.me*20000))
-		randNum := (ElectionTimeoutMax - ElectionTimeoutMin + rand.Intn(ElectionTimeoutMin) + 1)
-		electionTimeout := time.Millisecond * time.Duration(randNum) // rerandom election timeout
-		rf.lastActiveTime = time.Now()                               // update lastActiveTime
+		randNum := (ElectionTimeoutMin + rand.Intn(ElectionTimeoutMax-ElectionTimeoutMin))
+		electionTimeout = time.Millisecond * time.Duration(randNum) // rerandom election timeout
+		rf.lastActiveTime = time.Now()                              // update lastActiveTime
 		recordTime = rf.lastActiveTime
 
 		rf.mu.Unlock()
@@ -774,11 +775,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 // Call it when server need to be follower.
 // Make sure you hold the sycn.lock when you call it
 //
-func (rf *Raft) BeFollower(currentTerm int) {
+func (rf *Raft) BeFollower(currentTerm int, voteFor int) {
 	rf.serverState = ServerStateFollower // transfer to Follower
 	rf.currentTerm = currentTerm         // Update currentTerm
 	rf.lastActiveTime = time.Now()       // Update election timeout
 	// rf.votedFor = -1                     // Reset // ban it. It will cause brain-splited
+	rf.votedFor = voteFor
 	DPrintf("Server %v. State: %v. Term: %v. BeFollower(). rf.lastLogIndex: %v", rf.me, rf.serverState, rf.currentTerm, len(rf.log)-1)
 }
 
