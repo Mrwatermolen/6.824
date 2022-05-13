@@ -95,7 +95,7 @@ type Raft struct {
 
 	//  define by MH
 	serverState    int       // current server state 0: follower 1: candidate 2: leader
-	lastActiveTime time.Time // Last time server recieved msg from leader or higher term server
+	lastActiveTime time.Time // Last time server recieved msg from leader's heatrneat and server granted vote
 
 	applyCh chan ApplyMsg
 
@@ -258,7 +258,6 @@ type RequestAppendEntriesReply struct {
 	Term    int  //  for leader to update itself
 	Success bool // true if follower contained entry matching  prevLogIndex and prevLogTerm
 	// optimize for 2C
-	FollowerLastlogIndex  int
 	ConflictingTerm       int // the term of the conflicting entry
 	ConflictingFisrtIndex int // the first index it stores for that term
 }
@@ -309,10 +308,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	rf.lastActiveTime = time.Now() // Update election timeout
 	// Finally, grant vote
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateId
+	rf.lastActiveTime = time.Now() // Update election timeout
 	rf.persist()
 	DPrintf("Server %v. State: %v. Term: %v. Get RequestVote from Server %v. Grant vote", rf.me, rf.serverState, rf.currentTerm, args.CandidateId)
 }
@@ -325,7 +324,6 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	DPrintf("Server %v. State: %v. Term: %v. Get RequestAppendEntries from Server %v. \n AppendEntriesInfo: rf.log len: %v. rf.lastLogIndex: %v. len args.Entries: %v. args.LeaderCommit: %v:", rf.me, rf.serverState, rf.currentTerm, args.LeaderID, len(rf.log), lastLogIndex, len(args.Entries), args.LeaderCommit)
 	reply.Term = rf.currentTerm // reply currentTerm
 	reply.Success = false
-	reply.FollowerLastlogIndex = -1
 	reply.ConflictingTerm = 0
 	reply.ConflictingFisrtIndex = 0
 
@@ -350,7 +348,8 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	// Reply false if args.PrevLogIndex > lastLogIndex
 	if args.PrevLogIndex > lastLogIndex {
 		// optimize for Part2C
-		reply.FollowerLastlogIndex = lastLogIndex
+		reply.ConflictingTerm = -1
+		reply.ConflictingFisrtIndex = lastLogIndex
 		DPrintf("Server %v. State: %v. Term: %v. Get RequestAppendEntries from Server %v. Reply false if args.PrevLogIndex: %v > lastLogIndex: %v", rf.me, rf.serverState, rf.currentTerm, args.LeaderID, args.PrevLogIndex, lastLogIndex)
 		return
 	}
@@ -535,8 +534,8 @@ func (rf *Raft) sendRequestAppendEntries(serverId int, cond *sync.Cond, countAgr
 		// optimize for Part2C
 		if !reply.Success {
 			// preLogIndex > Follower Log len
-			if reply.FollowerLastlogIndex != -1 {
-				rf.leaderStateRecord.nextIndex[serverId] = reply.FollowerLastlogIndex
+			if reply.ConflictingTerm == -1 {
+				rf.leaderStateRecord.nextIndex[serverId] = reply.ConflictingFisrtIndex
 			} else if rf.log[reply.ConflictingFisrtIndex].Term != reply.ConflictingTerm {
 				rf.leaderStateRecord.nextIndex[serverId] = MaxInt(reply.ConflictingFisrtIndex-1, 0)
 				// If it does not find an entry with that term, it should set nextIndex = conflictIndex.
