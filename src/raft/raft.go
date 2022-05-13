@@ -99,6 +99,7 @@ type Raft struct {
 
 	applyCh chan ApplyMsg
 
+	// For Debug
 	heartbeatTimes int
 }
 
@@ -293,6 +294,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.serverState = ServerStateFollower // transfer to Follower
 	rf.currentTerm = args.Term           // Update currentTerm
 	lastLogIndex := len(rf.log) - 1
+	rf.persist()
 
 	// check up-to-date
 	// If the logs have last entries with different terms, then the log with the later term is more up-to-date.
@@ -342,6 +344,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	}
 
 	rf.BeFollower(args.Term, args.LeaderID)
+	rf.persist()
 	DPrintf("Server %v. State: %v. Term: %v. Get RequestAppendEntries from Server %v. Update lastActiveTime", rf.me, rf.serverState, rf.currentTerm, args.LeaderID)
 
 	// for old entries
@@ -487,9 +490,10 @@ func (rf *Raft) sendRequestAppendEntries(serverId int, cond *sync.Cond, countAgr
 
 		args.Term = rf.currentTerm
 		args.LeaderID = rf.me
-		args.PrevLogIndex = MinInt(len(rf.log)-1, rf.leaderStateRecord.nextIndex[serverId]) // If last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
+		// args.PrevLogIndex = MinInt(len(rf.log)-1, rf.leaderStateRecord.nextIndex[serverId])
+		args.PrevLogIndex = MaxInt(MinInt(len(rf.log)-1, rf.leaderStateRecord.nextIndex[serverId]-1), 0)
 		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-		args.Entries = append([]LogEntry{}, rf.log[(args.PrevLogIndex+1):]...)
+		args.Entries = append([]LogEntry{}, rf.log[(args.PrevLogIndex+1):]...) // If last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
 		args.LeaderCommit = rf.commandIndex
 		DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. Times: %v! args.PrevLogIndex: %v, args.PrevLogTerm: %v, args.Entries: %v args.LeaderCommit: %v HeartBeatID: %v. TaskID: %v", rf.me, rf.serverState, rf.currentTerm, serverId, counterRPC, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderCommit, heartbeatID, taskId)
 
@@ -533,23 +537,26 @@ func (rf *Raft) sendRequestAppendEntries(serverId int, cond *sync.Cond, countAgr
 		// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
 		// optimize for Part2C
 		if !reply.Success {
-			// preLogIndex > Follower Log len
-			if reply.ConflictingTerm == -1 {
+			/* if reply.ConflictingTerm == -1 {
 				rf.leaderStateRecord.nextIndex[serverId] = reply.ConflictingFisrtIndex
 			} else if rf.log[reply.ConflictingFisrtIndex].Term != reply.ConflictingTerm {
-				rf.leaderStateRecord.nextIndex[serverId] = MaxInt(reply.ConflictingFisrtIndex-1, 0)
-				// If it does not find an entry with that term, it should set nextIndex = conflictIndex.
-				// rf.leaderStateRecord.nextIndex[serverId] = reply.ConflictingFisrtIndex
+				rf.leaderStateRecord.nextIndex[serverId] = MaxInt(reply.ConflictingFisrtIndex - 1, 1)
 			} else {
 				rf.leaderStateRecord.nextIndex[serverId] = reply.ConflictingFisrtIndex
-				// If it finds an entry in its log with that term, it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
-				/* i := reply.ConflictingFisrtIndex
-				for ; i < len(rf.log); i++ {
-					if rf.log[i].Term != reply.ConflictingTerm {
+			} */
+			// If it does not find an entry with that term, it should set nextIndex = conflictIndex.
+			// If it finds an entry in its log with that term, it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
+			lastLogIndex := len(rf.log) - 1
+			rf.leaderStateRecord.nextIndex[serverId] = reply.ConflictingFisrtIndex
+			if reply.ConflictingTerm != -1 {
+				for i := lastLogIndex; i > 0; i-- {
+					if rf.log[i].Term == reply.ConflictingTerm {
+						rf.leaderStateRecord.nextIndex[serverId] = i + 1
+						break
+					} else if rf.log[i].Term < reply.ConflictingTerm {
 						break
 					}
 				}
-				rf.leaderStateRecord.nextIndex[serverId] = i */
 			}
 			DPrintf("Server %v. State: %v. Term: %v. Send RequestAppendEntries() to Server %v. Times: %v! Index not matched. rf.leaderStateRecord.nextIndex[serverId]: %v. continue HeartBeatID: %v. TaskID: %v", rf.me, rf.serverState, rf.currentTerm, serverId, counterRPC, rf.leaderStateRecord.nextIndex[serverId], heartbeatID, taskId)
 			counterRPC++
