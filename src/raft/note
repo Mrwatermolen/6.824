@@ -12,3 +12,13 @@ TestBackup2B：性能测试
 在少部分节点失效、多部分节点失效环境下，尽快完成两百个命令的正确处理。
 TestCount2B：检查无效通信的次数
 正常情况下，超时无效的 RPC 调用不能过多。
+
+Part 2C
+TestPersist12C()：basic persistence，将节点宕机恢复验证持久化正确性
+TestPersist22C()：more persistence，验证网络分区故障的情况下持久化数据的正确性
+TestPersist32C()：partitioned leader and one follower crash, leader restarts，验证Leader宕机能否正确回复日志（除了所有类型节点都要在append、vote那里要持久化，Leader还有其它的地方需要持久化）
+TestFigure82C()：Figure 8，测试paper中图8的错误情况，避免直接提交以前term的日志，其实只要知道怎么做就行了，在apply前加个判断term是否为最新的条件。
+TestUnreliableAgree2C()：模拟不可靠网络的情况
+TestFigure8Unreliable2C()：基于不可靠网络的图8测试
+TestReliableChurn2C()：感觉像测试并发啥的，这里没怎么出错就没看了
+TestUnreliableChurn2C()：同上
