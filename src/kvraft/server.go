@@ -12,7 +12,7 @@ import (
 )
 
 const Debug = false
-const ApplyTimeout = time.Second * 5
+const ApplyTimeout = time.Millisecond * 500
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -96,6 +96,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	select {
 	case res := <-ch:
+		if res.ClinetId != args.ClientId || res.SequenceNum != args.SequenceNum {
+			reply.Err = "" // TODO
+			ch <- res
+			return
+		}
 		/* kv.mu.Lock()
 		kv.lastRequestNum[args.ClientId] = args.SequenceNum
 		kv.mu.Unlock() */
@@ -147,8 +152,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	select {
 	case res := <-ch:
 		if res.ClinetId != args.ClientId || res.SequenceNum != args.SequenceNum {
-			reply.Err = ErrNoKey // TODO
-			break
+			reply.Err = "" // TODO
+			ch <- res
+			return
 		}
 		/* kv.mu.Lock()
 		kv.lastRequestNum[args.ClientId] = args.SequenceNum
