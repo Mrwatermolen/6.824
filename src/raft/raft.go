@@ -43,7 +43,7 @@ const (
 	ServerStateLeader // 2
 )
 
-const UpdateHeartbeatInterval = 60
+const UpdateHeartbeatInterval = 20
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -964,7 +964,7 @@ func (rf *Raft) ElectionTimer() {
 		rf.mu.Unlock()
 		time.Sleep(electionTimeout)
 	}
-	DPrintf("Server %v. State: %v. Term: %v. ElectionTimer() Quit. rf.killed.", rf.me, rf.serverState, rf.currentTerm)
+	// DPrintf("Server %v. State: %v. Term: %v. ElectionTimer() Quit. rf.killed.", rf.me, rf.serverState, rf.currentTerm)
 }
 
 //
@@ -987,7 +987,7 @@ func (rf *Raft) HeartBeatTimer() {
 
 		rf.mu.Unlock()
 	}
-	DPrintf("Server %v. State: %v. Term: %v. HeartBeatTimer() Quit. rf.killed.", rf.me, rf.serverState, rf.currentTerm)
+	//DPrintf("Server %v. State: %v. Term: %v. HeartBeatTimer() Quit. rf.killed.", rf.me, rf.serverState, rf.currentTerm)
 }
 
 //
