@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -11,8 +12,8 @@ import (
 	"6.824/raft"
 )
 
-const Debug = false
-const ApplyTimeout = time.Millisecond * 500
+const Debug = true
+const ApplyTimeout = time.Millisecond * 300
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -36,9 +37,10 @@ type Command struct {
 	SequenceNum int
 }
 
+// server will get this msg when command reachs a consensue in Raft.
 type NotifyMsg struct {
-	value       string
-	err         Err
+	Value       string
+	Err         Err
 	ClinetId    int64
 	SequenceNum int
 }
@@ -55,7 +57,7 @@ type KVServer struct {
 	// Your definitions here.
 	lastApplied    int                    // the index of raft log has applied in state machine
 	lastRequestNum map[int64]int          // tracks the latest serial number processed for the client
-	rpcGetCache    map[int64]NotifyMsg    //  cache for outdate Get request
+	rpcGetCache    map[int64]NotifyMsg    // cache for duplicate Get request
 	kvTable        map[string]string      // key-value table saves in memory
 	notifyChannel  map[int]chan NotifyMsg // notify server to respond the request
 }
@@ -63,15 +65,18 @@ type KVServer struct {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
+	// to check duplicate request
+	// the requests that are from different clinet can be concurrent.
+	// we can assume a client will make only one call into a Clerk at a time,
 	request, ok := kv.lastRequestNum[args.ClientId]
 	if !ok {
 		request = 0
 	}
-
 	// a command whose serial number has already been executed
 	if request >= args.SequenceNum {
-		reply.Err = kv.rpcGetCache[args.ClientId].err
-		reply.Value = kv.rpcGetCache[args.ClientId].value
+		reply.Err = kv.rpcGetCache[args.ClientId].Err
+		reply.Value = kv.rpcGetCache[args.ClientId].Value
+		DPrintf("StateMachine: %v. Get(). request %v >= args.SequenceNum %v. arg: %v. reply %v.", kv.me, request, args.SequenceNum, args, reply)
 		kv.mu.Unlock()
 		return
 	}
@@ -84,36 +89,39 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		ClinetId:    args.ClientId,
 		SequenceNum: args.SequenceNum,
 	}
-	index, _, isLeader := kv.rf.Start(command)
+	index, _, isLeader := kv.rf.Start(command) // try to append
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
 	kv.mu.Lock()
-	ch := kv.GetNotifyChannel(index)
+	ch := kv.getNotifyChannel(index)
 	kv.mu.Unlock()
 
+	// wati the log is applied to state machine
 	select {
 	case res := <-ch:
+		// check whether the log match this request
 		if res.ClinetId != args.ClientId || res.SequenceNum != args.SequenceNum {
+			// tell the clinet to retry
 			reply.Err = "" // TODO
-			ch <- res
+			DPrintf("StateMachine: %v. Get(). Command doesn't match. Send Start. arg: %v. res: %v. reply %v.", kv.me, args, res, reply)
+			ch <- res // send msg to channel, because there is another thread matched this log is still waitting
+			DPrintf("StateMachine: %v. Get(). Command doesn't match. Send End. arg: %v. res: %v. reply %v.", kv.me, args, res, reply)
 			return
 		}
-		/* kv.mu.Lock()
-		kv.lastRequestNum[args.ClientId] = args.SequenceNum
-		kv.mu.Unlock() */
-		reply.Err = res.err
-		reply.Value = res.value
-		DPrintf("StateMachine: %v. Get(). res: %v. arg: %v. reply %v", kv.me, res, args, reply)
+		reply.Err = res.Err
+		reply.Value = res.Value
+		DPrintf("StateMachine: %v. Get(). arg: %v. res: %v. reply %v.", kv.me, args, res, reply)
 	case <-time.After(ApplyTimeout):
-		DPrintf("StateMachine: %v. Get(). ErrTimeout. arg: %v.", kv.me, args)
 		reply.Err = ErrTimeout
+		DPrintf("StateMachine: %v. Get(). ErrTimeout. arg: %v.", kv.me, args)
 	}
 
+	// TODO: it is possible to happend 向已关闭通道发送数据触发 panic
 	kv.mu.Lock()
-	kv.RemoveNotifyChannel(index)
+	kv.removeNotifyChannel(index)
 	kv.mu.Unlock()
 }
 
@@ -128,6 +136,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// a command whose serial number has already been executed
 	if request >= args.SequenceNum {
 		reply.Err = OK
+		DPrintf("StateMachine: %v. PutAppend(). request %v >= args.SequenceNum %v. arg: %v. reply %v.", kv.me, request, args.SequenceNum, args, reply)
 		kv.mu.Unlock()
 		return
 	}
@@ -146,20 +155,19 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	kv.mu.Lock()
-	ch := kv.GetNotifyChannel(index)
+	ch := kv.getNotifyChannel(index)
 	kv.mu.Unlock()
 
 	select {
 	case res := <-ch:
 		if res.ClinetId != args.ClientId || res.SequenceNum != args.SequenceNum {
 			reply.Err = "" // TODO
+			DPrintf("StateMachine: %v. PutAppend(). Command doesn't match. Send Start. arg: %v. res: %v. reply %v.", kv.me, args, res, reply)
 			ch <- res
+			DPrintf("StateMachine: %v. PutAppend(). Command doesn't match. Send End. arg: %v. res: %v. reply %v.", kv.me, args, res, reply)
 			return
 		}
-		/* kv.mu.Lock()
-		kv.lastRequestNum[args.ClientId] = args.SequenceNum
-		kv.mu.Unlock() */
-		reply.Err = res.err
+		reply.Err = res.Err
 		DPrintf("StateMachine: %v. PutAppend(). res: %v. arg: %v.", kv.me, res, args)
 	case <-time.After(ApplyTimeout):
 		DPrintf("StateMachine: %v. PutAppend(). ErrTimeout. arg: %v.", kv.me, args)
@@ -167,79 +175,146 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	kv.mu.Lock()
-	kv.RemoveNotifyChannel(index)
+	kv.removeNotifyChannel(index)
 	kv.mu.Unlock()
 }
 
-func (kv *KVServer) Apply() {
+// recieve msg from Raft and apply the log to state machine
+func (kv *KVServer) apply() {
 	for !kv.killed() {
 		msg := <-kv.applyCh
-
+		DPrintf("StateMachine: %v. apply(). get msg. msg.CommandValid: %v. msg.SnapshotValid: %v. index: %v.", kv.me, msg.CommandValid, msg.SnapshotValid, msg.CommandIndex)
 		if msg.CommandValid {
 			kv.mu.Lock()
+			// to check duplicate log
 			if kv.lastApplied >= msg.CommandIndex {
+				DPrintf("StateMachine: %v. apply(). Command. Command has execute. msg: %v.", kv.me, msg)
 				kv.mu.Unlock()
 				continue
 			}
-			notify := kv.DealWithMsg(msg)
-			kv.lastApplied = msg.CommandIndex
-			_, isLeader := kv.rf.GetState()
+			notify := kv.dealWithMsg(msg)
+			kv.lastApplied = msg.CommandIndex // update lastApplied
+			go kv.createSnapshot()
+			_, isLeader := kv.rf.GetState() // check state
 			if !isLeader {
 				kv.mu.Unlock()
 				continue
 			}
-			DPrintf("StateMachine: %v. Apply(). Notify. msg.CommandIndex: %v. Notify. %v.", kv.me, msg.CommandIndex, notify)
-			ch := kv.GetNotifyChannel(msg.CommandIndex)
+			// state is leader. to nofity the sever to reply to request
+			DPrintf("StateMachine: %v. apply(). Command. msg.CommandIndex: %v. Notify: %v.", kv.me, msg.CommandIndex, notify)
+			ch := kv.getNotifyChannel(msg.CommandIndex)
 			kv.mu.Unlock()
+			DPrintf("StateMachine: %v. apply(). Command. Send nofityChan Start. msg.CommandIndex: %v. Notify: %v.", kv.me, msg.CommandIndex, notify)
 			ch <- notify
+			DPrintf("StateMachine: %v. apply(). Command. Send nofityChan End. msg.CommandIndex: %v. Notify: %v.", kv.me, msg.CommandIndex, notify)
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			term, _ := kv.rf.GetState()
+			DPrintf("StateMachine: %v. apply(). Snapshot. Term: %v. msg.SnapshotTerm: %v.", kv.me, term, msg.SnapshotTerm)
+			approve := kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot)
+			if !approve {
+				kv.mu.Unlock()
+				continue
+			}
+
+			kv.readSnapShot(msg.Snapshot)
+			kv.lastApplied = msg.SnapshotIndex
+			DPrintf("StateMachine: %v. apply(). Snapshot. End. kv.lastApplied: %v. msg.SnapshotTerm: %v.", kv.me, kv.lastApplied, msg.SnapshotTerm)
+			kv.mu.Unlock()
 		}
 	}
 }
 
-func (kv *KVServer) DealWithMsg(msg raft.ApplyMsg) NotifyMsg {
+// deal with log and return the msg
+func (kv *KVServer) dealWithMsg(msg raft.ApplyMsg) NotifyMsg {
 	var err Err
-	err = OK
-	var value string
+	err = OK         // OK is default
+	var value string // "" is default
 	command := msg.Command.(Command)
 	notify := NotifyMsg{
-		value:       value,
-		err:         err,
+		Value:       value,
+		Err:         err,
 		ClinetId:    command.ClinetId,
 		SequenceNum: command.SequenceNum,
 	}
-
+	DPrintf("StateMachine: %v. dealWithMsg(). command: %v.", kv.me, command)
+	// to check duplicate
 	if kv.lastRequestNum[command.ClinetId] >= command.SequenceNum {
 		if command.Op != OpGet {
 			return notify
 		}
-		// read Cache
+		// read cache
+		DPrintf("StateMachine: %v. dealWithMsg(). OpGet. msg: %v. check duplicate. kv.rpcGetCache[command.ClinetId]: %v.", kv.me, msg, kv.rpcGetCache[command.ClinetId])
 		return kv.rpcGetCache[command.ClinetId]
 	}
 	switch {
 	case command.Op == OpPut:
 		kv.kvTable[command.Key] = command.Value
-		// DPrintf("StateMachine: %v. Apply(). OpPut. msg: %v.", kv.me, msg)
+		DPrintf("StateMachine: %v. dealWithMsg(). OpPut. msg: %v. kv.kvTable[command.Key]: %v.", kv.me, msg, kv.kvTable[command.Key])
 	case command.Op == OpAppend:
 		kv.kvTable[command.Key] += command.Value
-		// DPrintf("StateMachine: %v. Apply(). OpAppend. msg: %v.", kv.me, msg)
+		DPrintf("StateMachine: %v. dealWithMsg(). OpAppend. msg: %v. kv.kvTable[command.Key]: %v.", kv.me, msg, kv.kvTable[command.Key])
 	case command.Op == OpGet:
-		// DPrintf("StateMachine: %v. Apply(). OpGet. msg: %v.", kv.me, msg)
 		_, ok := kv.kvTable[command.Key]
 		if !ok {
 			err = ErrNoKey
+			DPrintf("StateMachine: %v. dealWithMsg(). OpGet. msg: %v. ErrNoKey", kv.me, msg)
 		} else {
-			notify.value = kv.kvTable[command.Key]
+			notify.Value = kv.kvTable[command.Key]
 		}
 		kv.rpcGetCache[command.ClinetId] = notify // ceche get
 	default:
 		err = ErrType
 		// DPrintf("StateMachine: %v. Apply(). Msg type error. msg: %v.", kv.me, msg)
 	}
-	kv.lastRequestNum[command.ClinetId] = command.SequenceNum
+	kv.lastRequestNum[command.ClinetId] = command.SequenceNum // update lastRequestNum
 	return notify
 }
 
-func (kv *KVServer) GetNotifyChannel(commandIndex int) chan NotifyMsg {
+func (kv *KVServer) readSnapShot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var lastRequestNum map[int64]int
+	var rpcGetCache map[int64]NotifyMsg
+	var kvTable map[string]string
+	if d.Decode(&lastRequestNum) == nil && d.Decode(&rpcGetCache) == nil && d.Decode(&kvTable) == nil {
+		kv.lastRequestNum = lastRequestNum
+		kv.rpcGetCache = rpcGetCache
+		kv.kvTable = kvTable
+	}
+	DPrintf("StateMachine: %v. readSnapShot(). kv.lastRequestNum: %v. kv.rpcGetCache: %v. kv.kvTable: %v.", kv.me, kv.lastRequestNum, kv.rpcGetCache, kv.kvTable)
+}
+
+func (kv *KVServer) createSnapshot() {
+	if kv.maxraftstate < 0 {
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	size := kv.rf.GetRaftStateSize()
+	if size < kv.maxraftstate {
+		return
+	}
+	DPrintf("StateMachine: %v. createSnapshot(). RaftStateSize: %v. maxraftstate: %v.", kv.me, size, kv.maxraftstate)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.lastRequestNum)
+	e.Encode(kv.rpcGetCache)
+	e.Encode(kv.kvTable)
+	data := w.Bytes()
+	DPrintf("StateMachine: %v. createSnapshot(). Start snapshot. kv.lastRequestNum: %v. kv.rpcGetCache: %v. kv.kvTable: %v.", kv.me, kv.lastRequestNum, kv.rpcGetCache, kv.kvTable)
+	kv.rf.Snapshot(kv.lastApplied, data)
+	DPrintf("StateMachine: %v. createSnapshot(). End snapshot. kv.lastRequestNum: %v. kv.rpcGetCache: %v. kv.kvTable: %v.", kv.me, kv.lastRequestNum, kv.rpcGetCache, kv.kvTable)
+}
+
+// return a channel for notify server that log has been applied to state machine.
+// One log is bound to one channel,
+// but one channel may be bound to many request from different clinet.
+func (kv *KVServer) getNotifyChannel(commandIndex int) chan NotifyMsg {
 	_, ok := kv.notifyChannel[commandIndex]
 	if !ok {
 		kv.notifyChannel[commandIndex] = make(chan NotifyMsg)
@@ -247,13 +322,17 @@ func (kv *KVServer) GetNotifyChannel(commandIndex int) chan NotifyMsg {
 	return kv.notifyChannel[commandIndex]
 }
 
-func (kv *KVServer) RemoveNotifyChannel(commandIndex int) {
+// close NotifyChannel
+func (kv *KVServer) removeNotifyChannel(commandIndex int) {
+	DPrintf("StateMachine: %v. removeNotifyChannel(). commandIndex: %v.", kv.me, commandIndex)
 	_, ok := kv.notifyChannel[commandIndex]
 	if !ok {
+		DPrintf("StateMachine: %v. removeNotifyChannel(). commandIndex: %v. Not OK.", kv.me, commandIndex)
 		return
 	}
 	close(kv.notifyChannel[commandIndex])
 	delete(kv.notifyChannel, commandIndex)
+	DPrintf("StateMachine: %v. removeNotifyChannel(). commandIndex: %v. Delete.", kv.me, commandIndex)
 }
 
 //
@@ -309,7 +388,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rpcGetCache = make(map[int64]NotifyMsg)
 	kv.kvTable = make(map[string]string)
 	kv.notifyChannel = make(map[int]chan NotifyMsg)
-	go kv.Apply()
+	kv.readSnapShot(kv.rf.ReadSnapshot())
+	go kv.apply()
 
 	// You may need initialization code here.
 
