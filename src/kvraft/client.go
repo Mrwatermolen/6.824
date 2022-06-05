@@ -78,6 +78,7 @@ func (ck *Clerk) Get(key string) string {
 		}
 
 		if reply.Err == ErrTimeout {
+			DPrintf("Clinet %v. Get(). key: %v. sequenceNum: %v. RPC to %v OK. ErrTimeout reply: %v.", ck.id, key, ck.sequenceNum, ck.serverLeader, reply)
 			ck.serverLeader = (ck.serverLeader + 1) % len(ck.servers)
 			continue
 		}
@@ -86,6 +87,8 @@ func (ck *Clerk) Get(key string) string {
 			ck.serverLeader = (ck.serverLeader + 1) % len(ck.servers)
 			continue
 		}
+
+		DPrintf("Clinet %v. Get(). key: %v. sequenceNum: %v. RPC to %v OK. Err reply: %v.", ck.id, key, ck.sequenceNum, ck.serverLeader, reply)
 	}
 
 	return value
@@ -132,6 +135,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		}
 
 		if reply.Err == ErrTimeout {
+			DPrintf("Clinet %v. PutAppend(). key: %v. sequenceNum: %v. RPC to %v OK. ErrTimeout reply: %v.", ck.id, key, ck.sequenceNum, ck.serverLeader, reply)
 			ck.serverLeader = (ck.serverLeader + 1) % len(ck.servers)
 			continue
 		}
@@ -140,6 +144,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			ck.serverLeader = (ck.serverLeader + 1) % len(ck.servers)
 			continue
 		}
+
+		DPrintf("Clinet %v. PutAppend(). key: %v. sequenceNum: %v. RPC to %v OK. Err reply: %v.", ck.id, key, ck.sequenceNum, ck.serverLeader, reply)
 	}
 
 }

@@ -107,7 +107,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			// tell the clinet to retry
 			reply.Err = "" // TODO
 			DPrintf("StateMachine: %v. Get(). Command doesn't match. Send Start. arg: %v. res: %v. reply %v.", kv.me, args, res, reply)
-			ch <- res // send msg to channel, because there is another thread matched this log is still waitting
+			ch <- res // send msg to channel, because there is another thread matched this log is still waitting. It is safe for buffer is 1.
 			DPrintf("StateMachine: %v. Get(). Command doesn't match. Send End. arg: %v. res: %v. reply %v.", kv.me, args, res, reply)
 			return
 		}
@@ -192,7 +192,7 @@ func (kv *KVServer) apply() {
 				kv.mu.Unlock()
 				continue
 			}
-			notify := kv.dealWithMsg(msg)
+			notify := kv.dealWithCommandMsg(msg)
 			kv.lastApplied = msg.CommandIndex // update lastApplied
 			go kv.createSnapshot()
 			_, isLeader := kv.rf.GetState() // check state
@@ -203,10 +203,10 @@ func (kv *KVServer) apply() {
 			// state is leader. to nofity the sever to reply to request
 			DPrintf("StateMachine: %v. apply(). Command. msg.CommandIndex: %v. Notify: %v.", kv.me, msg.CommandIndex, notify)
 			ch := kv.getNotifyChannel(msg.CommandIndex)
-			kv.mu.Unlock()
 			DPrintf("StateMachine: %v. apply(). Command. Send nofityChan Start. msg.CommandIndex: %v. Notify: %v.", kv.me, msg.CommandIndex, notify)
-			ch <- notify
+			ch <- notify // hold on the lock
 			DPrintf("StateMachine: %v. apply(). Command. Send nofityChan End. msg.CommandIndex: %v. Notify: %v.", kv.me, msg.CommandIndex, notify)
+			kv.mu.Unlock()
 		} else if msg.SnapshotValid {
 			kv.mu.Lock()
 			term, _ := kv.rf.GetState()
@@ -226,7 +226,7 @@ func (kv *KVServer) apply() {
 }
 
 // deal with log and return the msg
-func (kv *KVServer) dealWithMsg(msg raft.ApplyMsg) NotifyMsg {
+func (kv *KVServer) dealWithCommandMsg(msg raft.ApplyMsg) NotifyMsg {
 	var err Err
 	err = OK         // OK is default
 	var value string // "" is default
@@ -237,28 +237,28 @@ func (kv *KVServer) dealWithMsg(msg raft.ApplyMsg) NotifyMsg {
 		ClinetId:    command.ClinetId,
 		SequenceNum: command.SequenceNum,
 	}
-	DPrintf("StateMachine: %v. dealWithMsg(). command: %v.", kv.me, command)
+	DPrintf("StateMachine: %v. dealWithCommandMsg(). command: %v.", kv.me, command)
 	// to check duplicate
 	if kv.lastRequestNum[command.ClinetId] >= command.SequenceNum {
 		if command.Op != OpGet {
 			return notify
 		}
 		// read cache
-		DPrintf("StateMachine: %v. dealWithMsg(). OpGet. msg: %v. check duplicate. kv.rpcGetCache[command.ClinetId]: %v.", kv.me, msg, kv.rpcGetCache[command.ClinetId])
+		DPrintf("StateMachine: %v. dealWithCommandMsg(). OpGet. msg: %v. check duplicate. kv.rpcGetCache[command.ClinetId]: %v.", kv.me, msg, kv.rpcGetCache[command.ClinetId])
 		return kv.rpcGetCache[command.ClinetId]
 	}
 	switch {
 	case command.Op == OpPut:
 		kv.kvTable[command.Key] = command.Value
-		DPrintf("StateMachine: %v. dealWithMsg(). OpPut. msg: %v. kv.kvTable[command.Key]: %v.", kv.me, msg, kv.kvTable[command.Key])
+		DPrintf("StateMachine: %v. dealWithCommandMsg(). OpPut. msg: %v. kv.kvTable[command.Key]: %v.", kv.me, msg, kv.kvTable[command.Key])
 	case command.Op == OpAppend:
 		kv.kvTable[command.Key] += command.Value
-		DPrintf("StateMachine: %v. dealWithMsg(). OpAppend. msg: %v. kv.kvTable[command.Key]: %v.", kv.me, msg, kv.kvTable[command.Key])
+		DPrintf("StateMachine: %v. dealWithCommandMsg(). OpAppend. msg: %v. kv.kvTable[command.Key]: %v.", kv.me, msg, kv.kvTable[command.Key])
 	case command.Op == OpGet:
 		_, ok := kv.kvTable[command.Key]
 		if !ok {
 			err = ErrNoKey
-			DPrintf("StateMachine: %v. dealWithMsg(). OpGet. msg: %v. ErrNoKey", kv.me, msg)
+			DPrintf("StateMachine: %v. dealWithCommandMsg(). OpGet. msg: %v. ErrNoKey", kv.me, msg)
 		} else {
 			notify.Value = kv.kvTable[command.Key]
 		}
@@ -317,7 +317,7 @@ func (kv *KVServer) createSnapshot() {
 func (kv *KVServer) getNotifyChannel(commandIndex int) chan NotifyMsg {
 	_, ok := kv.notifyChannel[commandIndex]
 	if !ok {
-		kv.notifyChannel[commandIndex] = make(chan NotifyMsg)
+		kv.notifyChannel[commandIndex] = make(chan NotifyMsg, 1) // set channel's buffer to be 1.
 	}
 	return kv.notifyChannel[commandIndex]
 }
