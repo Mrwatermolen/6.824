@@ -43,7 +43,7 @@ const (
 	ServerStateLeader // 2
 )
 
-const UpdateHeartbeatInterval = 32
+const UpdateHeartbeatInterval = 20
 
 //
 // as each Raft peer becomes aware that successive log entries are

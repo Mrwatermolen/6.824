@@ -119,7 +119,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		DPrintf("StateMachine: %v. Get(). ErrTimeout. arg: %v.", kv.me, args)
 	}
 
-	// TODO: it is possible to happend 向已关闭通道发送数据触发 panic
+	// Fixed: it is possible to happend 向已关闭通道发送数据触发 panic。
 	kv.mu.Lock()
 	kv.removeNotifyChannel(index)
 	kv.mu.Unlock()
@@ -183,7 +183,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) apply() {
 	for !kv.killed() {
 		msg := <-kv.applyCh
-		DPrintf("StateMachine: %v. apply(). get msg. msg.CommandValid: %v. msg.SnapshotValid: %v. index: %v.", kv.me, msg.CommandValid, msg.SnapshotValid, msg.CommandIndex)
+		DPrintf("StateMachine: %v. apply(). get msg. msg.CommandValid: %v. msg.SnapshotValid: %v. index: %v. msg: %v.", kv.me, msg.CommandValid, msg.SnapshotValid, msg.CommandIndex, msg)
 		if msg.CommandValid {
 			kv.mu.Lock()
 			// to check duplicate log
@@ -230,45 +230,54 @@ func (kv *KVServer) dealWithCommandMsg(msg raft.ApplyMsg) NotifyMsg {
 	var err Err
 	err = OK         // OK is default
 	var value string // "" is default
-	command := msg.Command.(Command)
-	notify := NotifyMsg{
+	switch msg.Command.(type) {
+	case Command:
+		command := msg.Command.(Command) // panic: interface conversion: interface {} is nil, not kvraft.Command？
+		notify := NotifyMsg{
+			Value:       value,
+			Err:         err,
+			ClinetId:    command.ClinetId,
+			SequenceNum: command.SequenceNum,
+		}
+		DPrintf("StateMachine: %v. dealWithCommandMsg(). command: %v.", kv.me, command)
+		// to check duplicate
+		if kv.lastRequestNum[command.ClinetId] >= command.SequenceNum {
+			if command.Op != OpGet {
+				return notify
+			}
+			// read cache
+			DPrintf("StateMachine: %v. dealWithCommandMsg(). OpGet. msg: %v. check duplicate. kv.rpcGetCache[command.ClinetId]: %v.", kv.me, msg, kv.rpcGetCache[command.ClinetId])
+			return kv.rpcGetCache[command.ClinetId]
+		}
+		switch {
+		case command.Op == OpPut:
+			kv.kvTable[command.Key] = command.Value
+			DPrintf("StateMachine: %v. dealWithCommandMsg(). OpPut. msg: %v. kv.kvTable[command.Key]: %v.", kv.me, msg, kv.kvTable[command.Key])
+		case command.Op == OpAppend:
+			kv.kvTable[command.Key] += command.Value
+			DPrintf("StateMachine: %v. dealWithCommandMsg(). OpAppend. msg: %v. kv.kvTable[command.Key]: %v.", kv.me, msg, kv.kvTable[command.Key])
+		case command.Op == OpGet:
+			_, ok := kv.kvTable[command.Key]
+			if !ok {
+				err = ErrNoKey
+				DPrintf("StateMachine: %v. dealWithCommandMsg(). OpGet. msg: %v. ErrNoKey", kv.me, msg)
+			} else {
+				notify.Value = kv.kvTable[command.Key]
+			}
+			kv.rpcGetCache[command.ClinetId] = notify // ceche get
+		default:
+			err = ErrType
+			// DPrintf("StateMachine: %v. Apply(). Msg type error. msg: %v.", kv.me, msg)
+		}
+		kv.lastRequestNum[command.ClinetId] = command.SequenceNum // update lastRequestNum
+		return notify
+	}
+	return NotifyMsg{
 		Value:       value,
 		Err:         err,
-		ClinetId:    command.ClinetId,
-		SequenceNum: command.SequenceNum,
+		ClinetId:    -1,
+		SequenceNum: -1,
 	}
-	DPrintf("StateMachine: %v. dealWithCommandMsg(). command: %v.", kv.me, command)
-	// to check duplicate
-	if kv.lastRequestNum[command.ClinetId] >= command.SequenceNum {
-		if command.Op != OpGet {
-			return notify
-		}
-		// read cache
-		DPrintf("StateMachine: %v. dealWithCommandMsg(). OpGet. msg: %v. check duplicate. kv.rpcGetCache[command.ClinetId]: %v.", kv.me, msg, kv.rpcGetCache[command.ClinetId])
-		return kv.rpcGetCache[command.ClinetId]
-	}
-	switch {
-	case command.Op == OpPut:
-		kv.kvTable[command.Key] = command.Value
-		DPrintf("StateMachine: %v. dealWithCommandMsg(). OpPut. msg: %v. kv.kvTable[command.Key]: %v.", kv.me, msg, kv.kvTable[command.Key])
-	case command.Op == OpAppend:
-		kv.kvTable[command.Key] += command.Value
-		DPrintf("StateMachine: %v. dealWithCommandMsg(). OpAppend. msg: %v. kv.kvTable[command.Key]: %v.", kv.me, msg, kv.kvTable[command.Key])
-	case command.Op == OpGet:
-		_, ok := kv.kvTable[command.Key]
-		if !ok {
-			err = ErrNoKey
-			DPrintf("StateMachine: %v. dealWithCommandMsg(). OpGet. msg: %v. ErrNoKey", kv.me, msg)
-		} else {
-			notify.Value = kv.kvTable[command.Key]
-		}
-		kv.rpcGetCache[command.ClinetId] = notify // ceche get
-	default:
-		err = ErrType
-		// DPrintf("StateMachine: %v. Apply(). Msg type error. msg: %v.", kv.me, msg)
-	}
-	kv.lastRequestNum[command.ClinetId] = command.SequenceNum // update lastRequestNum
-	return notify
 }
 
 func (kv *KVServer) readSnapShot(snapshot []byte) {
