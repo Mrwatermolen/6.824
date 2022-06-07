@@ -227,15 +227,13 @@ func (kv *KVServer) apply() {
 
 // deal with log and return the msg
 func (kv *KVServer) dealWithCommandMsg(msg raft.ApplyMsg) NotifyMsg {
-	var err Err
-	err = OK         // OK is default
-	var value string // "" is default
+	var value string
 	switch msg.Command.(type) {
 	case Command:
 		command := msg.Command.(Command) // panic: interface conversion: interface {} is nil, not kvraft.Command？
 		notify := NotifyMsg{
-			Value:       value,
-			Err:         err,
+			Value:       value, // "" is default
+			Err:         OK,    //OK is default
 			ClinetId:    command.ClinetId,
 			SequenceNum: command.SequenceNum,
 		}
@@ -259,14 +257,14 @@ func (kv *KVServer) dealWithCommandMsg(msg raft.ApplyMsg) NotifyMsg {
 		case command.Op == OpGet:
 			_, ok := kv.kvTable[command.Key]
 			if !ok {
-				err = ErrNoKey
+				notify.Err = ErrNoKey
 				DPrintf("StateMachine: %v. dealWithCommandMsg(). OpGet. msg: %v. ErrNoKey", kv.me, msg)
 			} else {
 				notify.Value = kv.kvTable[command.Key]
 			}
 			kv.rpcGetCache[command.ClinetId] = notify // ceche get
 		default:
-			err = ErrType
+			notify.Err = ErrType
 			// DPrintf("StateMachine: %v. Apply(). Msg type error. msg: %v.", kv.me, msg)
 		}
 		kv.lastRequestNum[command.ClinetId] = command.SequenceNum // update lastRequestNum
@@ -274,7 +272,7 @@ func (kv *KVServer) dealWithCommandMsg(msg raft.ApplyMsg) NotifyMsg {
 	}
 	return NotifyMsg{
 		Value:       value,
-		Err:         err,
+		Err:         OK,
 		ClinetId:    -1,
 		SequenceNum: -1,
 	}
