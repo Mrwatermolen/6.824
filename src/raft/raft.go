@@ -43,7 +43,9 @@ const (
 	ServerStateLeader // 2
 )
 
-const UpdateHeartbeatInterval = 40 // too fast heartbeat interval will casuse like "apply error: server 0 apply out of order, expected index 111, got 110"in Snapshot Test.
+// too fast heartbeat interval will casuse like "apply error: server 0 apply out of order, expected index 111, got 110" in Snapshot Test,
+// and too many duplicate logs enter the channel.
+const UpdateHeartbeatInterval = 80
 
 //
 // as each Raft peer becomes aware that successive log entries are
