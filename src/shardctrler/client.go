@@ -252,3 +252,7 @@ func (ck *Clerk) Move(shard int, gid int) {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+func (ck *Clerk) GetId() int64 {
+	return ck.id
+}
