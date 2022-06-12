@@ -37,6 +37,7 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ConfigNum   int
 	ClientId    int64
 	SequenceNum int
 }
@@ -49,6 +50,7 @@ type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
 	Op          string
+	ConfigNum   int
 	ClientId    int64
 	SequenceNum int
 }

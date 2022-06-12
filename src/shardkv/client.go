@@ -111,6 +111,7 @@ func (ck *Clerk) Get(key string) string {
 				args := GetArgs{
 					Key:         key,
 					Op:          OpGet,
+					ConfigNum:   ck.config.Num,
 					ClientId:    ck.id,
 					SequenceNum: ck.sequenceNum,
 				}
@@ -129,6 +130,7 @@ func (ck *Clerk) Get(key string) string {
 					return reply.Value
 				}
 				if reply.Err == ErrWrongGroup {
+					//ck.sequenceNum++
 					break
 				}
 				// ... not ok, or ErrWrongLeader
@@ -191,6 +193,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					Key:         key,
 					Value:       value,
 					Op:          op,
+					ConfigNum:   ck.config.Num,
 					ClientId:    ck.id,
 					SequenceNum: ck.sequenceNum,
 				}
@@ -209,6 +212,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					return
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
+					//ck.sequenceNum++
 					break
 				}
 				// ... not ok, or ErrWrongLeader

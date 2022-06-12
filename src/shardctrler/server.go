@@ -11,7 +11,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = true
+const Debug = false
 const ApplyTimeout = time.Millisecond * 300
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
