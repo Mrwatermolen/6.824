@@ -1,5 +1,7 @@
 package shardkv
 
+import "6.824/shardctrler"
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running Raft.
@@ -37,7 +39,7 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	ConfigNum   int
+	Config      shardctrler.Config
 	ClientId    int64
 	SequenceNum int
 }
@@ -50,7 +52,7 @@ type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
 	Op          string
-	ConfigNum   int
+	Config      shardctrler.Config
 	ClientId    int64
 	SequenceNum int
 }

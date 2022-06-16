@@ -111,7 +111,7 @@ func (ck *Clerk) Get(key string) string {
 				args := GetArgs{
 					Key:         key,
 					Op:          OpGet,
-					ConfigNum:   ck.config.Num,
+					Config:      ck.config,
 					ClientId:    ck.id,
 					SequenceNum: ck.sequenceNum,
 				}
@@ -131,7 +131,7 @@ func (ck *Clerk) Get(key string) string {
 				}
 				if reply.Err == ErrWrongGroup {
 					//ck.sequenceNum++
-					break
+					continue
 				}
 				// ... not ok, or ErrWrongLeader
 				if reply.Err == ErrTimeout {
@@ -143,6 +143,7 @@ func (ck *Clerk) Get(key string) string {
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
+		DPrintf("Clerk: %v. Get(). key: %v. sequenceNum: %v.", ck.id, key, ck.sequenceNum)
 		// ask controler for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
@@ -182,8 +183,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	} */
 
 	ck.sequenceNum++
-	DPrintf("Clerk: %v. Get(). key: %v. sequenceNum: %v.", ck.id, key, ck.sequenceNum)
+
 	for {
+		DPrintf("Clerk: %v. PutAppend(). key: %v. sequenceNum: %v.", ck.id, key, ck.sequenceNum)
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
@@ -193,7 +195,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					Key:         key,
 					Value:       value,
 					Op:          op,
-					ConfigNum:   ck.config.Num,
+					Config:      ck.config,
 					ClientId:    ck.id,
 					SequenceNum: ck.sequenceNum,
 				}
