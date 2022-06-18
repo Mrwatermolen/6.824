@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"6.824/labgob"
@@ -14,15 +15,16 @@ import (
 
 const Debug = true
 const ApplyTimeout = time.Millisecond * 300
-const QueryConfigTime = time.Millisecond * 60
+const QueryConfigTime = time.Millisecond * 100
+
+const (
+	ShardOpJoin    = "Join"
+	ShardOpLeave   = "Leave"
+	ConfigOpUpdate = "Update"
+)
 
 type KVData map[string]string
 type ShardOp string
-
-const (
-	ShardOpJoin  = "Join"
-	ShardOpLeave = "Leave"
-)
 
 type RuningState string
 
@@ -52,13 +54,13 @@ type Op struct {
 }
 
 type Command struct {
-	Op     string
-	Key    string
-	Value  string
-	Config shardctrler.Config
-	Shard  int
-	Change ConfigChange
-	Data   []byte
+	Op        string
+	Key       string
+	Value     string
+	Shard     int
+	ConfigNum int
+	Change    ConfigChange
+	Data      []byte
 	// specify request
 	ClinetId    int64
 	SequenceNum int
@@ -76,15 +78,17 @@ type NotifyMsg struct {
 }
 
 type ConfigChange struct {
-	Shard     int
-	Op        ShardOp
-	FormerGid int
+	Shard      int
+	Op         ShardOp
+	FormerGid  int
+	CurrentGid int
+	NewConfig  shardctrler.Config
 }
 
 type Shard struct {
-	Config     shardctrler.Config
-	LastConfig shardctrler.Config
-	Kvtable    KVData
+	ConfigNum     int
+	Kvtable       KVData
+	LastConfigNum int // for GetShardData
 }
 
 type ShardKV struct {
@@ -95,7 +99,8 @@ type ShardKV struct {
 	make_end     func(string) *labrpc.ClientEnd
 	gid          int
 	ctrlers      []*labrpc.ClientEnd
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate int   // snapshot if log grows this big
+	dead         int32 // set by Kill()
 
 	// Your definitions here.
 	lastApplied    int                    // the index of raft log has applied in state machine
@@ -127,9 +132,9 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	n := key2shard(args.Key)
-	if kv.shards[n].Config.Shards[n] != kv.gid || args.Config.Num != kv.shards[n].Config.Num {
+	if args.ConfigNum != kv.shards[n].ConfigNum {
 		reply.Err = ErrWrongGroup
-		DPrintf("Gourp: %v. StateMachine: %v. Get(). ErrWrongGroup. kv.curConfig: %v. args.config: %v. Shards: %v to Gid: %v. arg: %v.", kv.gid, kv.me, kv.curConfig, args.Config, key2shard(args.Key), kv.curConfig.Shards[key2shard(args.Key)], args)
+		DPrintf("Gourp: %v. StateMachine: %v. Get(). ErrWrongGroup. kv.curConfig: %v. args.configNum: %v. Shards: %v ConfigNum: %v. arg: %v.", kv.gid, kv.me, kv.curConfig, args.ConfigNum, key2shard(args.Key), kv.shards[n].ConfigNum, args)
 		kv.mu.Unlock()
 		return
 	}
@@ -139,7 +144,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		Key:         args.Key,
 		Value:       "",
 		Op:          args.Op,
-		Config:      args.Config,
+		ConfigNum:   args.ConfigNum,
 		ClinetId:    args.ClientId,
 		SequenceNum: args.SequenceNum,
 	}
@@ -196,9 +201,9 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	n := key2shard(args.Key)
-	if kv.shards[n].Config.Shards[n] != kv.gid || args.Config.Num != kv.shards[n].Config.Num {
+	if args.ConfigNum != kv.shards[n].ConfigNum {
 		reply.Err = ErrWrongGroup
-		DPrintf("Gourp: %v. StateMachine: %v. PutAppend(). ErrWrongGroup. kv.curConfig: %v %v. args.config: %v. Shards: %v to Gid: %v. arg: %v.", kv.gid, kv.me, kv.curConfig, kv.shards[key2shard(args.Key)].Config, args.Config, key2shard(args.Key), kv.curConfig.Shards[key2shard(args.Key)], args)
+		DPrintf("Gourp: %v. StateMachine: %v. PutAppend(). ErrWrongGroup. kv.curConfig: %v. args.configNum: %v. Shards: %v ConfigNum: %v. arg: %v.", kv.gid, kv.me, kv.curConfig, args.ConfigNum, key2shard(args.Key), kv.shards[n].ConfigNum, args)
 		kv.mu.Unlock()
 		return
 	}
@@ -208,7 +213,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Key:         args.Key,
 		Value:       args.Value,
 		Op:          args.Op,
-		Config:      args.Config,
+		ConfigNum:   args.ConfigNum,
 		ClinetId:    args.ClientId,
 		SequenceNum: args.SequenceNum,
 	}
@@ -257,7 +262,7 @@ func (kv *ShardKV) GetShardData(args *GetShardDataArgs, reply *GetShardDatareply
 		kv.mu.Unlock()
 		return
 	}
-	if args.Config.Num != kv.shards[args.Shard].LastConfig.Num {
+	if args.ConfigNum != kv.shards[args.Shard].LastConfigNum {
 		reply.Err = ErrWrongGroup
 		//DPrintf("Gourp: %v. StateMachine: %v. PutAppend(). ErrWrongGroup. kv.curConfig: %v. args.config: %v. Shards: %v to Gid: %v. arg: %v.", kv.gid, kv.me, kv.curConfig.Num, args.ConfigNum, key2shard(args.Key), kv.curConfig.Shards[key2shard(args.Key)], args)
 		kv.mu.Unlock()
@@ -266,7 +271,7 @@ func (kv *ShardKV) GetShardData(args *GetShardDataArgs, reply *GetShardDatareply
 	kv.mu.Unlock()
 
 	command := Command{
-		Config:      args.Config,
+		ConfigNum:   args.ConfigNum,
 		Shard:       args.Shard,
 		Op:          OpGetShardData,
 		ClinetId:    args.ClientId,
@@ -311,7 +316,7 @@ func (kv *ShardKV) GetShardData(args *GetShardDataArgs, reply *GetShardDatareply
 
 // recieve msg from Raft and apply the log to state machine
 func (kv *ShardKV) apply() {
-	for {
+	for !kv.killed() {
 		msg := <-kv.applyCh
 		// DPrintf("Gourp: %v. StateMachine: %v. apply(). get msg. msg.CommandValid: %v. msg.SnapshotValid: %v. index: %v. msg: %v.", kv.gid, kv.me, msg.CommandValid, msg.SnapshotValid, msg.CommandIndex, msg)
 		if msg.CommandValid {
@@ -324,7 +329,7 @@ func (kv *ShardKV) apply() {
 			}
 			notify := kv.dealWithCommandMsg(msg)
 			kv.lastApplied = msg.CommandIndex // update lastApplied
-			go kv.createSnapshot()
+			kv.createSnapshot()
 			_, isLeader := kv.rf.GetState() // check state
 			if !isLeader {
 				kv.mu.Unlock()
@@ -335,7 +340,7 @@ func (kv *ShardKV) apply() {
 			ch := kv.getNotifyChannel(msg.CommandIndex)
 			// DPrintf("Gourp: %v. StateMachine: %v. apply(). Command. Send nofityChan Start. msg.CommandIndex: %v. Notify: %v.", kv.gid, kv.me, msg.CommandIndex, notify)
 			ch <- notify // hold on the lock
-			DPrintf("Gourp: %v. StateMachine: %v. apply(). Command. Send nofityChan End. msg.CommandIndex: %v. Notify: %v.", kv.gid, kv.me, msg.CommandIndex, notify)
+			DPrintf("Gourp: %v. StateMachine: %v. apply(). Command. Send nofityChan End. msg.CommandIndex: %v. Notify: %v. msg: %v.", kv.gid, kv.me, msg.CommandIndex, notify, msg)
 			kv.mu.Unlock()
 		} else if msg.SnapshotValid {
 			kv.mu.Lock()
@@ -353,6 +358,7 @@ func (kv *ShardKV) apply() {
 			kv.mu.Unlock()
 		}
 	}
+	DPrintf("Gourp: %v. StateMachine: %v. apply(). Killed", kv.gid, kv.me)
 }
 
 // deal with log and return the msg
@@ -381,7 +387,7 @@ func (kv *ShardKV) dealWithCommandMsg(msg raft.ApplyMsg) NotifyMsg {
 		case command.Op == OpPut:
 			n := key2shard(command.Key)
 			// ownership and config match
-			if kv.shards[n].Config.Shards[n] != kv.gid || command.Config.Num != kv.shards[n].Config.Num {
+			if command.ConfigNum != kv.shards[n].ConfigNum {
 				DPrintf("Gourp: %v. StateMachine: %v. dealWithCommandMsg(). OpPut. ErrWrongGroup. msg: %v. PKey: %v.", kv.gid, kv.me, msg, command.Key)
 				notify.Err = ErrWrongGroup
 				return notify
@@ -390,7 +396,7 @@ func (kv *ShardKV) dealWithCommandMsg(msg raft.ApplyMsg) NotifyMsg {
 			// DPrintf("Gourp: %v. StateMachine: %v. dealWithCommandMsg(). OpPut. msg: %v. shards[n].kvtable[command.Key]: %v.", kv.gid, kv.me, msg, kv.shards[n].Kvtable[command.Key])
 		case command.Op == OpAppend:
 			n := key2shard(command.Key)
-			if kv.shards[n].Config.Shards[n] != kv.gid || command.Config.Num != kv.shards[n].Config.Num {
+			if command.ConfigNum != kv.shards[n].ConfigNum {
 				// DPrintf("Gourp: %v. StateMachine: %v. dealWithCommandMsg(). OpAppend. ErrWrongGroup. msg: %v. AKey: %v.", kv.gid, kv.me, msg, command.Key)
 				notify.Err = ErrWrongGroup
 				return notify
@@ -399,7 +405,7 @@ func (kv *ShardKV) dealWithCommandMsg(msg raft.ApplyMsg) NotifyMsg {
 			// DPrintf("Gourp: %v. StateMachine: %v. dealWithCommandMsg(). OpAppend. msg: %v. shards[n].kvtable[command.Key]: %v.", kv.gid, kv.me, msg, kv.shards[n].Kvtable[command.Key])
 		case command.Op == OpGet:
 			n := key2shard(command.Key)
-			if kv.shards[n].Config.Shards[n] != kv.gid || command.Config.Num != kv.shards[n].Config.Num {
+			if command.ConfigNum != kv.shards[n].ConfigNum {
 				// DPrintf("Gourp: %v. StateMachine: %v. dealWithCommandMsg(). OpAppend. ErrWrongGroup. msg: %v. AKey: %v.", kv.gid, kv.me, msg, command.Key)
 				notify.Err = ErrWrongGroup
 				return notify // don't save cache and request
@@ -407,7 +413,7 @@ func (kv *ShardKV) dealWithCommandMsg(msg raft.ApplyMsg) NotifyMsg {
 			_, ok := kv.shards[n].Kvtable[command.Key]
 			if !ok {
 				notify.Err = ErrNoKey
-				// DPrintf("Gourp: %v. StateMachine: %v. dealWithCommandMsg(). OpGet. msg: %v. ErrNoKey", kv.gid, kv.me, msg)
+				DPrintf("Gourp: %v. StateMachine: %v. dealWithCommandMsg(). OpGet. msg: %v. ErrNoKey. shard: %v data: %v.", kv.gid, kv.me, msg, n, kv.shards[n])
 			} else {
 				notify.Value = kv.shards[n].Kvtable[command.Key]
 			}
@@ -417,6 +423,9 @@ func (kv *ShardKV) dealWithCommandMsg(msg raft.ApplyMsg) NotifyMsg {
 			if notify.Err == ErrWrongGroup {
 				return notify // don't save this request
 			}
+		case command.Op == OpPushShardData:
+			kv.dealWithOpPushShardData(command)
+			notify.Err = OK
 		case command.Op == OpConfigChange:
 			kv.dealWithOpConfigChange(command)
 		default:
@@ -436,93 +445,62 @@ func (kv *ShardKV) dealWithCommandMsg(msg raft.ApplyMsg) NotifyMsg {
 }
 
 func (kv *ShardKV) dealWithOpConfigChange(command Command) {
-	if kv.shards[command.Shard].Config.Num >= command.Config.Num {
-		DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Quit. curNum: %v. newConfig: %v.", kv.gid, kv.me, kv.shards[command.Shard].Config.Num, command.Config.Num)
-		return
-	}
 	switch command.Change.Op {
 	case ShardOpJoin:
-		kv.shards[command.Shard].Config = command.Config
-		kv.shards[command.Shard].LastConfig = command.Config
-		kv.checkConfigNum()
-		if len(command.Data) < 1 || command.Data == nil {
-			DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Join. NoData End. newConfig: %v.", kv.gid, kv.me, kv.shards[command.Shard].Config.Num)
+		if kv.shards[command.Shard].ConfigNum >= command.ConfigNum {
+			DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Join Quit. Shard: %v. curNum: %v. commadConfig: %v.", kv.gid, kv.me, command.Shard, kv.shards[command.Shard].ConfigNum, command.ConfigNum)
 			return
 		}
-		r := bytes.NewBuffer(command.Data)
-		d := labgob.NewDecoder(r)
-		var table KVData
-		var requestNum map[int64]int
-		var caches map[int64]NotifyMsg
-		d.Decode(&table)
-		d.Decode(&requestNum)
-		d.Decode(&caches)
-		kv.shards[command.Shard].Kvtable = make(KVData)
-		for key, value := range table {
-			kv.shards[command.Shard].Kvtable[key] = value
-			DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Join. key: %v. v: %v.", kv.gid, kv.me, key, value)
+		// kv.shards[command.Shard].ConfigNum = command.ConfigNum
+		// kv.shards[command.Shard].LastConfigNum = command.ConfigNum
+		// kv.decodeKVShard(command.Data, command.Shard)
+		if command.Change.FormerGid == 0 {
+			kv.shards[command.Shard].ConfigNum = command.ConfigNum
 		}
-		for key, value := range requestNum {
-			v, ok := kv.lastRequestNum[key]
-			DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Join. Record. id: %v. kv: %v. new: %v.", kv.gid, kv.me, key, v, value)
-			if ok && value <= v {
-				continue
-			}
-			kv.lastRequestNum[key] = value
-			kv.rpcGetCache[key] = caches[key]
-		}
-		DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Join. End. Shard: %v. newConfig: %v.", kv.gid, kv.me, command.Shard, kv.shards[command.Shard].Config)
-		DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Join. map: %v.", kv.gid, kv.me, kv.shards[command.Shard].Kvtable)
+		DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Join. Shard: %v. newConfigNum: %v.", kv.gid, kv.me, command.Shard, kv.shards[command.Shard].ConfigNum)
+		// DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Join. map: %v.", kv.gid, kv.me, kv.shards[command.Shard].Kvtable)
 	case ShardOpLeave:
-		kv.shards[command.Shard].Config = command.Config
-		kv.checkConfigNum()
-		DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Leave. End. Shard: %v. newConfig: %v.", kv.gid, kv.me, command.Shard, kv.shards[command.Shard])
-	default:
-		kv.shards[command.Shard].Config = command.Config
-		kv.checkConfigNum()
-		DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Update. End. Shard: %v. newConfig: %v.", kv.gid, kv.me, command.Shard, kv.shards[command.Shard])
-	}
-}
-
-func (kv *ShardKV) checkConfigNum() {
-	for i := 0; i < len(kv.shards)-1; i++ {
-		if kv.shards[i].Config.Num != kv.shards[i+1].Config.Num {
-			DPrintf("Gourp: %v. StateMachine: %v. checkConfigNum(). End. Shard: %v. Num: %v. NNum: %v.", kv.gid, kv.me, i, kv.shards[i].Config.Num, kv.shards[i+1].Config.Num)
+		if kv.shards[command.Shard].ConfigNum >= command.ConfigNum {
+			DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Leave Quit. Shard: %v. curNum: %v. commadConfig: %v.", kv.gid, kv.me, command.Shard, kv.shards[command.Shard].ConfigNum, command.ConfigNum)
 			return
 		}
+		kv.shards[command.Shard].ConfigNum = command.ConfigNum
+		go kv.sendRequestPushShardData(kv.make_end, command.Change.NewConfig.Groups[command.Change.CurrentGid], command.Shard, command.ConfigNum, kv.encoideKVShard(command.Shard))
+		DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Leave. End. Shard: %v. newConfig: %v.", kv.gid, kv.me, command.Shard, kv.shards[command.Shard])
+	case ConfigOpUpdate:
+		if kv.curConfig.Num >= command.ConfigNum {
+			DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Update Quit. curNum: %v. commadConfig: %v.", kv.gid, kv.me, kv.curConfig, command.ConfigNum)
+			return
+		}
+		kv.curConfig = command.Change.NewConfig
+		DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Update. newConfig: %v.", kv.gid, kv.me, kv.curConfig)
+	default:
+		if kv.shards[command.Shard].ConfigNum >= command.ConfigNum {
+			DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Quit. Shard: %v. curNum: %v. commadConfig: %v.", kv.gid, kv.me, command.Shard, kv.shards[command.Shard].ConfigNum, command.ConfigNum)
+			return
+		}
+		kv.shards[command.Shard].ConfigNum = command.ConfigNum
+		DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Null. Shard: %v. newConfig: %v.", kv.gid, kv.me, command.Shard, kv.shards[command.Shard])
 	}
-	kv.curConfig.Num = kv.shards[0].Config.Num
-	DPrintf("Gourp: %v. StateMachine: %v. checkConfigNum(). Update. End. kv.curConfig.Num: %v.", kv.gid, kv.me, kv.curConfig.Num)
 }
 
 func (kv *ShardKV) dealWithOpGetShardData(command Command, notify *NotifyMsg) {
-	if kv.shards[command.Shard].LastConfig.Num != command.Config.Num {
-		DPrintf("Gourp: %v. StateMachine: %v. dealWithOpGetShardData(). Please Wait. Shard: %v. LastConfig.Num: %v. command.Config.Num: %v. myConfig: %v.", kv.gid, kv.me, command.Shard, kv.shards[command.Shard].LastConfig.Num, command.Config.Num, kv.shards[command.Shard].Config)
+	if kv.shards[command.Shard].LastConfigNum != command.ConfigNum {
+		DPrintf("Gourp: %v. StateMachine: %v. dealWithOpGetShardData(). Please Wait. Shard: %v. LastConfig.Num: %v. command.Config.Num: %v. myConfig: %v.", kv.gid, kv.me, command.Shard, kv.shards[command.Shard].LastConfigNum, command.ConfigNum, kv.shards[command.Shard].ConfigNum)
 		notify.Err = ErrWrongGroup
 		return
 	}
-	shardsMap := make(KVData)
-	requestReplic := make(map[int64]int)
-	cacheReplica := make(map[int64]NotifyMsg)
-	for key, value := range kv.shards[command.Shard].Kvtable {
-		// DPrintf("Gourp: %v. StateMachine: %v. dealWithOpGetShardData(). shard: %v match key: %v. v: %v.", kv.gid, kv.me, command.Shard, key, value)
-		shardsMap[key] = value
+	notify.Data = kv.encoideKVShard(command.Shard)
+	DPrintf("Gourp: %v. StateMachine: %v. dealWithCommandMsg(). End. last: %v. Command.Config: %v. Shard: %v. notify.Err: %v.", kv.gid, kv.me, kv.shards[command.Shard].LastConfigNum, command.ConfigNum, command.Shard, notify.Err)
+}
+
+func (kv *ShardKV) dealWithOpPushShardData(command Command) {
+	DPrintf("Gourp: %v. StateMachine: %v. dealWithOpPushShardData(). Shard: %v. ConfigNum: %v. cmdConfigNum: %v.", kv.gid, kv.me, command.Shard, kv.shards[command.Shard].ConfigNum, command.ConfigNum)
+	if kv.shards[command.Shard].ConfigNum >= command.ConfigNum {
+		return
 	}
-	for k, v := range kv.lastRequestNum {
-		if command.Shard == key2shard(kv.rpcGetCache[k].Key) {
-			requestReplic[k] = v
-			cacheReplica[k] = kv.rpcGetCache[k]
-		}
-	}
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(shardsMap)
-	e.Encode(requestReplic)
-	e.Encode(cacheReplica)
-	data := w.Bytes()
-	notify.Data = data
-	// kv.rpcGetCache[command.ClinetId] = notify
-	DPrintf("Gourp: %v. StateMachine: %v. dealWithCommandMsg(). End. last: %v. Command.Config: %v. Shard: %v. notify.Err: %v.", kv.gid, kv.me, kv.shards[command.Shard].LastConfig.Num, command.Config.Num, command.Shard, notify.Err)
+	kv.decodeKVShard(command.Data, command.Shard)
+	kv.shards[command.Shard].ConfigNum = command.ConfigNum
 }
 
 func (kv *ShardKV) readSnapShot(snapshot []byte) {
@@ -534,21 +512,24 @@ func (kv *ShardKV) readSnapShot(snapshot []byte) {
 	d := labgob.NewDecoder(r)
 	var lastRequestNum map[int64]int
 	var rpcGetCache map[int64]NotifyMsg
+	var curConfig shardctrler.Config
 	var shards []Shard
-	if d.Decode(&lastRequestNum) == nil && d.Decode(&rpcGetCache) == nil && d.Decode(&shards) == nil {
+	if d.Decode(&lastRequestNum) == nil && d.Decode(&rpcGetCache) == nil && d.Decode(&curConfig) == nil && d.Decode(&shards) == nil {
 		kv.lastRequestNum = lastRequestNum
 		kv.rpcGetCache = rpcGetCache
+		kv.curConfig = curConfig
 		kv.shards = shards
 	}
-	DPrintf("Gourp: %v. StateMachine: %v. readSnapShot(). kv.lastRequestNum: %v. kv.rpcGetCache: %v. kv.kvTable: %v. ", kv.gid, kv.me, kv.lastRequestNum, kv.rpcGetCache, kv.shards)
+	DPrintf("Gourp: %v. StateMachine: %v. readSnapShot(). Config: %v. lastRequestNum: %v. rpcGetCache: %v. kvTable: %v. ", kv.gid, kv.me, curConfig, lastRequestNum, rpcGetCache, shards)
+	DPrintf("Gourp: %v. StateMachine: %v. readSnapShot(). kv.curConfig: %v. kv.lastRequestNum: %v. kv.rpcGetCache: %v. kv.kvTable: %v. ", kv.gid, kv.me, kv.curConfig, kv.lastRequestNum, kv.rpcGetCache, kv.shards)
 }
 
 func (kv *ShardKV) createSnapshot() {
 	if kv.maxraftstate < 0 {
 		return
 	}
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	/* kv.mu.Lock()
+	defer kv.mu.Unlock() */
 	size := kv.rf.GetRaftStateSize()
 	if size < kv.maxraftstate {
 		return
@@ -558,11 +539,12 @@ func (kv *ShardKV) createSnapshot() {
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.lastRequestNum)
 	e.Encode(kv.rpcGetCache)
+	e.Encode(kv.curConfig)
 	e.Encode(kv.shards)
 	data := w.Bytes()
-	DPrintf("Gourp: %v. StateMachine: %v. createSnapshot(). Start snapshot. kv.lastRequestNum: %v. kv.rpcGetCache: %v. kv.shards: %v.", kv.gid, kv.me, kv.lastRequestNum, kv.rpcGetCache, kv.shards)
+	DPrintf("Gourp: %v. StateMachine: %v. createSnapshot(). Start snapshot. kv.lastApplied: %v. kv.curConfig: %v. kv.lastRequestNum: %v. kv.rpcGetCache: %v. kv.kvTable: %v. ", kv.gid, kv.me, kv.lastApplied, kv.curConfig, kv.lastRequestNum, kv.rpcGetCache, kv.shards)
 	kv.rf.Snapshot(kv.lastApplied, data)
-	DPrintf("Gourp: %v. StateMachine: %v. createSnapshot(). End snapshot. kv.lastRequestNum: %v. kv.rpcGetCache: %v. kv.shards: %v.", kv.gid, kv.me, kv.lastRequestNum, kv.rpcGetCache, kv.shards)
+	DPrintf("Gourp: %v. StateMachine: %v. createSnapshot(). End snapshot. kv.lastApplied: %v. kv.curConfig: %v. kv.lastRequestNum: %v. kv.rpcGetCache: %v. kv.kvTable: %v. ", kv.gid, kv.me, kv.lastApplied, kv.curConfig, kv.lastRequestNum, kv.rpcGetCache, kv.shards)
 }
 
 // return a channel for notify server that log has been applied to state machine.
@@ -587,39 +569,60 @@ func (kv *ShardKV) removeNotifyChannel(commandIndex int) {
 }
 
 func (kv *ShardKV) queryLastestConfig() {
+	// for !kv.killed() { can't pass TestUnreliable3?
 	for {
 		_, isLeader := kv.rf.GetState()
 		// DPrintf("Gourp: %v. queryLastestConfig(). StateMachine: %v.", kv.gid, kv.me)
 		if isLeader {
 			kv.mu.Lock()
 			conifg := kv.clerk.Query(kv.curConfig.Num + 1)
+			opNum := 0
 			if kv.curConfig.Num < conifg.Num {
 				for i, shard := range kv.shards {
-					DPrintf("Gourp: %v. StateMachine: %v. queryLastestConfig(). i:%v. shard.ConfigNum: %v. conifg: %v. ", kv.gid, kv.me, i, shard.Config.Num, conifg)
-					if conifg.Num <= shard.Config.Num {
+					DPrintf("Gourp: %v. StateMachine: %v. queryLastestConfig(). Shard: %v. shard.ConfigNum: %v. conifg: %v. ", kv.gid, kv.me, i, shard.ConfigNum, conifg)
+					if conifg.Num <= shard.ConfigNum {
 						continue
 					}
+					opNum++
 					var change ConfigChange
-					if shard.Config.Shards[i] == kv.gid && conifg.Shards[i] != kv.gid {
+					if kv.curConfig.Shards[i] == kv.gid && conifg.Shards[i] != kv.gid {
 						// Shard OP Leave
 						change = ConfigChange{
-							Shard:     i,
-							Op:        ShardOpLeave,
-							FormerGid: kv.gid,
+							Shard:      i,
+							Op:         ShardOpLeave,
+							FormerGid:  kv.gid,
+							CurrentGid: conifg.Shards[i],
+							NewConfig:  conifg,
 						}
-					} else if shard.Config.Shards[i] != kv.gid && conifg.Shards[i] == kv.gid {
+					} else if kv.curConfig.Shards[i] != kv.gid && conifg.Shards[i] == kv.gid {
 						// Shard OP Join
 						change = ConfigChange{
-							Shard:     i,
-							Op:        ShardOpJoin,
-							FormerGid: shard.Config.Shards[i],
+							Shard:      i,
+							Op:         ShardOpJoin,
+							FormerGid:  kv.curConfig.Shards[i],
+							CurrentGid: kv.gid,
+							NewConfig:  conifg,
 						}
 					} else {
 						change = ConfigChange{
-							Shard: i,
+							Shard:     i,
+							NewConfig: conifg,
 						}
 					}
-					go kv.addChangeConfig(kv.make_end, change, shard.Config, conifg)
+					go kv.addChangeConfig(kv.make_end, change, kv.curConfig, conifg)
+				}
+				if opNum == 0 {
+					DPrintf("Gourp: %v. StateMachine: %v. queryLastestConfig(). Update Config. newConifg: %v. ", kv.gid, kv.me, conifg)
+					cmd := Command{
+						ConfigNum: conifg.Num,
+						Change: ConfigChange{
+							Op:        ConfigOpUpdate,
+							NewConfig: conifg,
+						},
+						Op: OpConfigChange,
+					}
+
+					kv.rf.Start(cmd)
 				}
 				kv.mu.Unlock()
 			} else {
@@ -629,63 +632,151 @@ func (kv *ShardKV) queryLastestConfig() {
 		time.Sleep(QueryConfigTime)
 		//DPrintf("Gourp: %v. queryLastestConfig(). StateMachine: %v. Awake", kv.gid, kv.me)
 	}
+	DPrintf("Gourp: %v. queryLastestConfig(). StateMachine: %v. Killed", kv.gid, kv.me)
 }
 
 func (kv *ShardKV) addChangeConfig(make_end func(string) *labrpc.ClientEnd, change ConfigChange, oldConfig shardctrler.Config, newConfig shardctrler.Config) {
 	var index int
 	var isLeader bool
-	var cmd Command
-	switch change.Op {
-	case ShardOpJoin:
-		DPrintf("Gourp: %v. StateMachine: %v. addChangeConfig(). Join. log: %v. new: %v. old: %v.", kv.gid, kv.me, change, newConfig, oldConfig)
-		if change.FormerGid != 0 {
-			reply, ok := kv.sendRequestGetShardData(make_end, oldConfig.Groups[change.FormerGid], oldConfig, change.Shard)
-			if !ok {
-				return
-			}
-			cmd = Command{
-				Change: change,
-				Config: newConfig,
-				Shard:  change.Shard,
-				Data:   reply.Data,
-				Op:     OpConfigChange,
-			}
-		} else {
-			cmd = Command{
-				Change: change,
-				Config: newConfig,
-				Shard:  change.Shard,
-				Data:   nil,
-				Op:     OpConfigChange,
-			}
-		}
-	case ShardOpLeave:
-		cmd = Command{
-			Change: change,
-			Config: newConfig,
-			Shard:  change.Shard,
-			Data:   nil,
-			Op:     OpConfigChange,
-		}
-	default:
-		cmd = Command{
-			Change: change,
-			Config: newConfig,
-			Shard:  change.Shard,
-			Data:   nil,
-			Op:     OpConfigChange,
-		}
-
+	cmd := Command{
+		ConfigNum: newConfig.Num,
+		Shard:     change.Shard,
+		Change:    change,
+		Op:        OpConfigChange,
 	}
 
 	index, _, isLeader = kv.rf.Start(cmd)
 	if isLeader {
-		DPrintf("Gourp: %v. StateMachine: %v. addChangeConfig()). Shard: %v. i: %v. ch: %v.", kv.gid, kv.me, cmd.Shard, index, change.Op)
+		DPrintf("Gourp: %v. StateMachine: %v. addChangeConfig(). Shard: %v. Log index: %v. Op: %v.", kv.gid, kv.me, cmd.Shard, index, change.Op)
+	}
+}
+
+func (kv *ShardKV) PushShardData(args *PushShardDataArg, reply *PushShardDataRply) {
+	kv.mu.Lock()
+	DPrintf("Gourp: %v. StateMachine: %v. PushShardData(). args: %v.", kv.gid, kv.me, args)
+	request, ok := kv.lastRequestNum[args.ClientId]
+	if !ok {
+		request = 0
+	}
+	if request >= args.SequenceNum {
+		reply.Err = kv.rpcGetCache[args.ClientId].Err
+		DPrintf("Gourp: %v. StateMachine: %v. PushShardData(). request %v >= args.SequenceNum %v. arg: %v.", kv.gid, kv.me, request, args.SequenceNum, args)
+		kv.mu.Unlock()
+		return
+	}
+	if kv.shards[args.Shard].ConfigNum >= args.ConfigNum {
+		reply.Err = OK
+		DPrintf("Gourp: %v. StateMachine: %v. PushShardData(). Shard: %v. ConfigNum: %v. >= args.ConfigNum. arg: %v.", kv.gid, kv.me, args.Shard, kv.shards[args.Shard].ConfigNum, args)
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	command := Command{
+		Op:          OpPushShardData,
+		Shard:       args.Shard,
+		ConfigNum:   args.ConfigNum,
+		Data:        args.Data,
+		ClinetId:    args.ClientId,
+		SequenceNum: args.SequenceNum,
+	}
+	index, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	kv.mu.Lock()
+	ch := kv.getNotifyChannel(index)
+	kv.mu.Unlock()
+
+	select {
+	case res := <-ch:
+		if res.ClinetId != args.ClientId || res.SequenceNum != args.SequenceNum {
+			reply.Err = "" // TODO
+			DPrintf("Gourp: %v. StateMachine: %v. PushShardData()(). Command doesn't match. Send Start. arg: %v. res: %v. reply %v.", kv.gid, kv.me, args, res, reply)
+			ch <- res
+			DPrintf("Gourp: %v. StateMachine: %v. PushShardData()(). Command doesn't match. Send End. arg: %v. res: %v. reply %v.", kv.gid, kv.me, args, res, reply)
+			return
+		}
+		reply.Err = res.Err
+		DPrintf("Gourp: %v. StateMachine: %v. PushShardData()(). res: %v. arg: %v.", kv.gid, kv.me, res, args)
+	case <-time.After(ApplyTimeout):
+		DPrintf("Gourp: %v. StateMachine: %v. PushShardData()(). ErrTimeout. arg: %v. index: %v.", kv.gid, kv.me, args, index)
+		reply.Err = ErrTimeout
+	}
+
+	kv.mu.Lock()
+	kv.removeNotifyChannel(index)
+	kv.mu.Unlock()
+}
+
+type PushShardDataArg struct {
+	Shard       int
+	ConfigNum   int
+	Data        []byte
+	ClientId    int64
+	SequenceNum int
+}
+
+type PushShardDataRply struct {
+	Err Err
+}
+
+func (kv *ShardKV) sendRequestPushShardData(make_end func(string) *labrpc.ClientEnd, servers []string, shard int, configNum int, data []byte) {
+	id := nrand()
+	seq := 1
+	i := 0
+	DPrintf("Gourp: %v. StateMachine: %v. sendRequestPushShardData(). id: %v. Pusg Shard %v to %v. newConfigNum: %v.", kv.gid, kv.me, id, shard, servers, configNum)
+	for !kv.killed() {
+		args := PushShardDataArg{
+			Shard:       shard,
+			ConfigNum:   configNum,
+			Data:        data,
+			ClientId:    id,
+			SequenceNum: seq,
+		}
+		reply := PushShardDataRply{}
+		DPrintf("Gourp: %v. StateMachine: %v. sendRequestPushShardData(). id: %v. to %v.", kv.gid, kv.me, id, servers[i])
+
+		ok := make_end(servers[i]).Call("ShardKV.PushShardData", &args, &reply)
+
+		if !ok {
+			i = (i + 1) % len(servers)
+			time.Sleep(100 * time.Millisecond)
+			DPrintf("Gourp: %v. StateMachine: %v. sendRequestPushShardData(). !ok. id: %v. Pusg Shard %v to %v. newConfigNum: %v.", kv.gid, kv.me, id, shard, servers, configNum)
+			continue
+		}
+
+		if reply.Err == OK {
+			DPrintf("Gourp: %v. StateMachine: %v. sendRequestPushShardData(). OK. id: %v. Pusg Shard %v to %v. newConfigNum: %v.", kv.gid, kv.me, id, shard, servers, configNum)
+			return
+		}
+
+		if reply.Err == ErrWrongGroup {
+			i = (i + 1) % len(servers)
+			time.Sleep(100 * time.Millisecond)
+			DPrintf("Gourp: %v. StateMachine: %v. sendRequestPushShardData(). ErrWrongGroup. id: %v. Pusg Shard %v to %v. newConfigNum: %v.", kv.gid, kv.me, id, shard, servers, configNum)
+			continue
+		}
+
+		if reply.Err == ErrTimeout {
+			i = (i + 1) % len(servers)
+			time.Sleep(100 * time.Millisecond)
+			DPrintf("Gourp: %v. StateMachine: %v. sendRequestPushShardData(). ErrTimeout. id: %v. Pusg Shard %v to %v. newConfigNum: %v.", kv.gid, kv.me, id, shard, servers, configNum)
+			continue
+		}
+
+		if reply.Err == ErrWrongLeader {
+			i = (i + 1) % len(servers)
+			time.Sleep(100 * time.Millisecond)
+			DPrintf("Gourp: %v. StateMachine: %v. sendRequestPushShardData(). ErrWrongLeader. id: %v. Pusg Shard %v to %v. newConfigNum: %v.", kv.gid, kv.me, id, shard, servers, configNum)
+			continue
+		}
 	}
 }
 
 type GetShardDataArgs struct {
-	Config      shardctrler.Config
+	ConfigNum   int
 	Shard       int
 	ClientId    int64
 	SequenceNum int
@@ -696,17 +787,18 @@ type GetShardDatareply struct {
 	Data []byte
 }
 
-func (kv *ShardKV) sendRequestGetShardData(make_end func(string) *labrpc.ClientEnd, servers []string, oldConfig shardctrler.Config, shard int) (GetShardDatareply, bool) {
+func (kv *ShardKV) sendRequestGetShardData(make_end func(string) *labrpc.ClientEnd, servers []string, oldConfigNum int, shard int) (GetShardDatareply, bool) {
 	id := nrand()
 	seq := 1
 	i := 0
-	DPrintf("Gourp: %v. StateMachine: %v. sendRequestGetShardData(). id: %v. to %v.", kv.gid, kv.me, id, servers)
+	DPrintf("Gourp: %v. StateMachine: %v. sendRequestGetShardData(). id: %v. to %v. For shard: %v.", kv.gid, kv.me, id, servers, shard)
 	for {
 		if i >= len(servers) {
 			return GetShardDatareply{}, false
 		}
+		DPrintf("Gourp: %v. StateMachine: %v. sendRequestGetShardData(). id: %v. to %v.", kv.gid, kv.me, id, servers[i])
 		args := GetShardDataArgs{
-			Config:      oldConfig,
+			ConfigNum:   oldConfigNum,
 			Shard:       shard,
 			ClientId:    id,
 			SequenceNum: seq,
@@ -746,6 +838,58 @@ func (kv *ShardKV) sendRequestGetShardData(make_end func(string) *labrpc.ClientE
 	}
 }
 
+func (kv *ShardKV) encoideKVShard(shard int) []byte {
+	shardsMap := make(KVData)
+	requestReplic := make(map[int64]int)
+	cacheReplica := make(map[int64]NotifyMsg)
+	for key, value := range kv.shards[shard].Kvtable {
+		// DPrintf("Gourp: %v. StateMachine: %v. dealWithOpGetShardData(). shard: %v match key: %v. v: %v.", kv.gid, kv.me, command.Shard, key, value)
+		shardsMap[key] = value
+	}
+	for k, v := range kv.lastRequestNum {
+		if shard == key2shard(kv.rpcGetCache[k].Key) {
+			requestReplic[k] = v
+			cacheReplica[k] = kv.rpcGetCache[k]
+		}
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(shardsMap)
+	e.Encode(requestReplic)
+	e.Encode(cacheReplica)
+	data := w.Bytes()
+	return data
+}
+
+func (kv *ShardKV) decodeKVShard(data []byte, shard int) {
+	if len(data) < 1 || data == nil {
+		// DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Join. NoData End. newConfig: %v.", kv.gid, kv.me, kv.shards[shard].ConfigNum)
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var table KVData
+	var requestNum map[int64]int
+	var caches map[int64]NotifyMsg
+	d.Decode(&table)
+	d.Decode(&requestNum)
+	d.Decode(&caches)
+	kv.shards[shard].Kvtable = make(KVData)
+	for key, value := range table {
+		kv.shards[shard].Kvtable[key] = value
+		// DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Join. key: %v. v: %v.", kv.gid, kv.me, key, value)
+	}
+	for key, value := range requestNum {
+		v, ok := kv.lastRequestNum[key]
+		// DPrintf("Gourp: %v. StateMachine: %v. dealWithOpConfigChange(). Join. Record. id: %v. kv: %v. new: %v.", kv.gid, kv.me, key, v, value)
+		if ok && value <= v {
+			continue
+		}
+		kv.lastRequestNum[key] = value
+		kv.rpcGetCache[key] = caches[key]
+	}
+}
+
 //
 // the tester calls Kill() when a ShardKV instance won't
 // be needed again. you are not required to do anything
@@ -753,8 +897,14 @@ func (kv *ShardKV) sendRequestGetShardData(make_end func(string) *labrpc.ClientE
 // turn off debug output from this instance.
 //
 func (kv *ShardKV) Kill() {
+	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+}
+
+func (kv *ShardKV) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
 }
 
 //
@@ -815,7 +965,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	for i := 0; i < len(kv.shards); i++ {
 		kv.shards[i].Kvtable = make(KVData)
 	}
-	// kv.readSnapShot(kv.rf.ReadSnapshot())
+	kv.readSnapShot(kv.rf.ReadSnapshot())
 	go kv.apply()
 	go kv.queryLastestConfig()
 	return kv

@@ -111,11 +111,12 @@ func (ck *Clerk) Get(key string) string {
 				args := GetArgs{
 					Key:         key,
 					Op:          OpGet,
-					Config:      ck.config,
+					ConfigNum:   ck.config.Num,
 					ClientId:    ck.id,
 					SequenceNum: ck.sequenceNum,
 				}
 				reply := GetReply{}
+				DPrintf("Clerk: %v. Get(). key: %v. sequenceNum: %v. config: %v. shard: %v. server: %v.", ck.id, key, ck.sequenceNum, ck.config, shard, servers[si])
 				srv := ck.make_end(servers[si])
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 
@@ -195,7 +196,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					Key:         key,
 					Value:       value,
 					Op:          op,
-					Config:      ck.config,
+					ConfigNum:   ck.config.Num,
 					ClientId:    ck.id,
 					SequenceNum: ck.sequenceNum,
 				}
