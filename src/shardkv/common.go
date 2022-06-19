@@ -25,7 +25,6 @@ const (
 	OpPut           = "Put"
 	OpAppend        = "Append"
 	OpConfigChange  = "ConfigChange"
-	OpGetShardData  = "GetShardData"
 	OpPushShardData = "PushShardData"
 )
 

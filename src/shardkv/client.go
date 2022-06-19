@@ -186,7 +186,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.sequenceNum++
 
 	for {
-		DPrintf("Clerk: %v. PutAppend(). key: %v. sequenceNum: %v.", ck.id, key, ck.sequenceNum)
+		DPrintf("Clerk: %v. PutAppend(). key: %v. value: %v. sequenceNum: %v.", ck.id, key, value, ck.sequenceNum)
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
